@@ -4,6 +4,7 @@
   }
 
   const lines = [];
+  const lineRecords = [];
   let lineBuffer = [];
   let currentY = null;
 
@@ -25,13 +26,24 @@
     const text = lineBuffer.map((item) => item.text).join('').trim();
     if (text && !isFontProbeLine(text)) {
       const maxFontSize = Math.max(...lineBuffer.map((item) => item.fontSize));
+      const minFontSize = Math.min(...lineBuffer.map((item) => item.fontSize));
+      // Representative y for the line: the min y of its fragments (top-most),
+      // matching how canvas rows align with the rare-char <img> translate y.
+      const minY = lineBuffer.reduce((acc, item) => Math.min(acc, item.y), Infinity);
+      let prefix = '';
       if (maxFontSize >= 27) {
-        lines.push(`## ${text}`);
+        prefix = '## ';
       } else if (maxFontSize >= 23) {
-        lines.push(`### ${text}`);
-      } else {
-        lines.push(text);
+        prefix = '### ';
       }
+      lines.push(`${prefix}${text}`);
+      lineRecords.push({
+        text,
+        y: minY,
+        fontSize: maxFontSize,
+        minFontSize,
+        prefix,
+      });
     }
 
     lineBuffer = [];
@@ -99,8 +111,14 @@
       flushLine();
       return Array.from(new Set(lines)).join('\n\n');
     },
+    getLinesWithCoords() {
+      flushLine();
+      // Return a deep-ish copy so callers can't mutate internal state.
+      return lineRecords.map((record) => ({ ...record }));
+    },
     clearMarkdown() {
       lines.length = 0;
+      lineRecords.length = 0;
       lineBuffer.length = 0;
       currentY = null;
       window.__wrpaRenderStable = false;

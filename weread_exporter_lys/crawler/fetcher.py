@@ -5,7 +5,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .extractor import BODY_SELECTORS, IMAGE_SELECTORS, ChapterContent, html_text_to_markdown
+from .extractor import (
+    BODY_SELECTORS,
+    IMAGE_SELECTORS,
+    ChapterContent,
+    html_text_to_markdown,
+    merge_rare_chars,
+)
+from .images import ImageFilter
 
 READER_URL = "https://weread.qq.com/web/reader/{book_id}"
 HOOK_PATH = Path(__file__).with_name("hook.js")
@@ -292,7 +299,7 @@ class WeReadPageFetcher:
     async def clear_wrpa_markdown(self) -> None:
         await self.page.evaluate("() => window.wrpaHandler && window.wrpaHandler.clearMarkdown()")
 
-    async def extract_chapter_content(self) -> ChapterContent:
+    async def extract_chapter_content(self, *, images_dir: Path | None = None) -> ChapterContent:
         anti_crawl_status = await self.detect_anti_crawl()
 
         # WRPA page: DOM text is CSS garbage — wait for canvas, then use hook
@@ -307,7 +314,30 @@ class WeReadPageFetcher:
                     "() => window.wrpaHandler ? window.wrpaHandler.getMarkdown() : ''"
                 )
             images = await self._image_urls(IMAGE_SELECTORS)
-            wrpa_markdown = html_text_to_markdown(wrpa_markdown, images, base_url=self.page.url)
+
+            # Rare-character overlay: collect <img.h-pic> with chapter coords,
+            # download to images_dir, then interleave into canvas text by y.
+            rare_srcs: set[str] = set()
+            rare_chars: list[dict] = []
+            if images_dir is not None:
+                raw_rare = await self._rare_char_images()
+                if raw_rare:
+                    rare_chars = await self._download_rare_chars(raw_rare, images_dir)
+                    rare_srcs = {rc.get("src", "") for rc in raw_rare if rc.get("src")}
+
+            if rare_chars:
+                line_records = await self.page.evaluate(
+                    "() => window.wrpaHandler ? window.wrpaHandler.getLinesWithCoords() : []"
+                )
+                body_markdown = merge_rare_chars(list(line_records or []), rare_chars)
+                # Non-rare images (illustrations, etc.) still append at the end,
+                # skipping any src already inlined as a rare char.
+                tail_images = ImageFilter().markdown_lines(
+                    images, base_url=self.page.url, exclude=rare_srcs
+                )
+                wrpa_markdown = "\n\n".join(p for p in (body_markdown, "\n".join(tail_images)) if p).strip()
+            else:
+                wrpa_markdown = html_text_to_markdown(wrpa_markdown, images, base_url=self.page.url)
 
             # Fallback to DOM if WRPA canvas has no text (flyleaf / section header pages)
             if not wrpa_markdown or len(wrpa_markdown) < 30:
@@ -342,7 +372,7 @@ class WeReadPageFetcher:
             """
         )
 
-    async def go_next(self, previous_markdown: str) -> bool:
+    async def go_next(self, previous_markdown: str, *, images_dir: Path | None = None) -> bool:
         await self.clear_wrpa_markdown()
         clicked = await self.page.evaluate(
             """
@@ -360,7 +390,7 @@ class WeReadPageFetcher:
             await self.page.keyboard.press("ArrowRight")
 
         await self.page.wait_for_timeout(int(self.delay * 1000))
-        current = await self.extract_chapter_content()
+        current = await self.extract_chapter_content(images_dir=images_dir)
         return bool(current.markdown and current.markdown != previous_markdown)
 
     async def _first_text(self, selectors: tuple[str, ...]) -> str:
@@ -409,6 +439,79 @@ class WeReadPageFetcher:
             list(selectors),
         )
         return list(urls or [])
+
+    async def _rare_char_images(self) -> list[dict]:
+        """Collect rare-character <img> overlays with their chapter coordinates.
+
+        Targets ``.passage-content img.h-pic`` whose ``src`` points at the
+        unencrypted rare-char asset host (``res.weread.qq.com/wrepub/``). Each
+        returned record carries the parsed ``translate(x, y)`` so the caller can
+        merge the image into the canvas text flow by y.
+        """
+        records = await self.page.evaluate(
+            """
+            () => {
+              const out = [];
+              const imgs = document.querySelectorAll(
+                '.passage-content img.h-pic'
+              );
+              for (const img of imgs) {
+                const src = img.src || img.getAttribute('data-src') || '';
+                if (!src.includes('res.weread.qq.com/wrepub/')) continue;
+                const transform = img.getAttribute('style') || '';
+                const m = transform.match(
+                  /translate\\(\\s*([-\\d.]+)px\\s*,\\s*([-\\d.]+)px\\s*\\)/
+                );
+                out.push({
+                  src: src,
+                  data_wr_id: img.getAttribute('data-wr-id') || null,
+                  x: m ? parseFloat(m[1]) : null,
+                  y: m ? parseFloat(m[2]) : null,
+                  width: img.getAttribute('data-w') || null,
+                  ratio: img.getAttribute('data-ratio') || null,
+                });
+              }
+              return out;
+            }
+            """
+        )
+        return list(records or [])
+
+    async def _download_rare_chars(
+        self,
+        rare_chars: list[dict],
+        images_dir: Path,
+    ) -> list[dict]:
+        """Download each rare-char PNG into ``images_dir`` and tag its local path.
+
+        Filenames use ``data-wr-id`` (unique per occurrence) so a reused ``src``
+        can't overwrite another occurrence. Existing files are kept (resume-safe).
+        ``local_path`` is the path relative to a chapter ``content/N.md`` file,
+        i.e. ``../images/<name>.png``.
+        """
+        if not rare_chars:
+            return []
+        images_dir.mkdir(parents=True, exist_ok=True)
+        enriched: list[dict] = []
+        for index, rc in enumerate(rare_chars):
+            src = rc.get("src")
+            if not src:
+                continue
+            name = rc.get("data_wr_id") or f"rare_{index}"
+            target = images_dir / f"{name}.png"
+            if not target.exists():
+                try:
+                    response = await self.page.request.get(src)
+                    if response.ok:
+                        target.write_bytes(await response.body())
+                except Exception:
+                    # Leave local_path even if download failed so the token still
+                    # appears in text; the missing file can be re-fetched later.
+                    pass
+            rc = dict(rc)
+            rc["local_path"] = f"../images/{name}.png"
+            enriched.append(rc)
+        return enriched
 
 
 def run_async(coro):

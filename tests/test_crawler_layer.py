@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from weread_exporter_lys.crawler.extractor import html_text_to_markdown, normalize_markdown_text
+from weread_exporter_lys.crawler.extractor import html_text_to_markdown, merge_rare_chars, normalize_markdown_text
 from weread_exporter_lys.crawler.images import ImageFilter
 from weread_exporter_lys.crawler.state import CrawlState
 from weread_exporter_lys.crawler.weread import WeReadCrawler, WeReadCrawlerResult
@@ -49,6 +49,22 @@ class ImageFilterTests(unittest.TestCase):
             ],
         )
 
+    def test_excludes_rare_char_srcs_already_inlined(self):
+        image_filter = ImageFilter()
+        urls = [
+            "https://res.weread.qq.com/wrepub/epub_41595377_3",  # rare char, inlined
+            "https://res.weread.qq.com/wrepub/epub_41595377_4",  # rare char, inlined
+            "https://res.weread.qq.com/illustration.jpg",         # normal illustration, keep
+        ]
+        exclude = {
+            "https://res.weread.qq.com/wrepub/epub_41595377_3",
+            "https://res.weread.qq.com/wrepub/epub_41595377_4",
+        }
+
+        lines = image_filter.markdown_lines(urls, exclude=exclude)
+
+        self.assertEqual(lines, ["![](https://res.weread.qq.com/illustration.jpg)"])
+
 
 class ExtractorTests(unittest.TestCase):
     def test_normalizes_markdown_text(self):
@@ -58,6 +74,59 @@ class ExtractorTests(unittest.TestCase):
     def test_combines_text_and_images(self):
         markdown = html_text_to_markdown("正文", ["https://example.test/a.jpg"])
         self.assertEqual(markdown, "正文\n\n![](https://example.test/a.jpg)")
+
+
+class RareCharMergeTests(unittest.TestCase):
+    def test_no_rare_chars_returns_lines_unchanged(self):
+        lines = [
+            {"text": "第一行", "y": 100.0, "fontSize": 16, "prefix": ""},
+            {"text": "第二行", "y": 140.0, "fontSize": 16, "prefix": ""},
+        ]
+        self.assertEqual(merge_rare_chars(lines, []), "第一行\n\n第二行")
+
+    def test_appends_rare_char_to_closest_line_by_y(self):
+        # Sample mirrors 《五帝本纪》"熊罴貔貅〔图〕虎": the rare char sits between
+        # the 貔貅 line and the 虎 line; it should attach to the closest one.
+        lines = [
+            {"text": "教熊罴貔貅", "y": 3070.0, "fontSize": 16, "prefix": ""},
+            {"text": "虎，以与炎帝战于阪泉", "y": 3100.0, "fontSize": 16, "prefix": ""},
+        ]
+        rare = [{"local_path": "../images/wrqsm9qrxc61.png", "x": 129.0, "y": 3086.0}]
+        result = merge_rare_chars(lines, rare)
+        # 3086 is closer to 3100 (dist 14) than 3070 (dist 16) → attaches to 虎 line end.
+        self.assertEqual(
+            result,
+            "教熊罴貔貅\n\n虎，以与炎帝战于阪泉![](../images/wrqsm9qrxc61.png)",
+        )
+
+    def test_same_line_multiple_rare_chars_ordered_by_x(self):
+        lines = [{"text": "甲乙", "y": 100.0, "fontSize": 16, "prefix": ""}]
+        rare = [
+            {"local_path": "../images/b.png", "x": 300.0, "y": 100.0},
+            {"local_path": "../images/a.png", "x": 129.0, "y": 100.0},
+            {"local_path": "../images/c.png", "x": 458.0, "y": 100.0},
+        ]
+        result = merge_rare_chars(lines, rare)
+        self.assertEqual(result, "甲乙![](../images/a.png)![](../images/b.png)![](../images/c.png)")
+
+    def test_preserves_heading_prefix(self):
+        lines = [
+            {"text": "第一卷 五帝本纪第一", "y": 50.0, "fontSize": 28, "prefix": "## "},
+            {"text": "正文", "y": 100.0, "fontSize": 16, "prefix": ""},
+        ]
+        rare = [{"local_path": "../images/x.png", "x": 10.0, "y": 100.0}]
+        result = merge_rare_chars(lines, rare)
+        self.assertEqual(result, "## 第一卷 五帝本纪第一\n\n正文![](../images/x.png)")
+
+    def test_orphan_rare_char_beyond_tolerance_appended_at_end(self):
+        lines = [{"text": "正文", "y": 100.0, "fontSize": 16, "prefix": ""}]
+        rare = [{"local_path": "../images/far.png", "x": 10.0, "y": 5000.0}]
+        result = merge_rare_chars(lines, rare, line_tolerance=20.0)
+        self.assertEqual(result, "正文\n\n![](../images/far.png)")
+
+    def test_empty_lines_returns_empty(self):
+        self.assertEqual(merge_rare_chars([], [{"local_path": "../images/x.png", "x": 0, "y": 0}]), "")
+
 
 
 class WeReadCrawlerTests(unittest.TestCase):

@@ -27,6 +27,7 @@ class WeReadCrawlerPaths:
     toc_path: Path
     state_path: Path
     content_dir: Path
+    images_dir: Path
     auth_state_path: Path
 
 
@@ -43,12 +44,14 @@ class WeReadCrawler:
             toc_path=book_dir / "toc.json",
             state_path=book_dir / "state.json",
             content_dir=book_dir / "content",
+            images_dir=book_dir / "images",
             auth_state_path=auth_state_path,
         )
 
     async def _crawl(self, request: ExportRequest) -> WeReadCrawlerResult:
         paths = self.paths_for(request)
         paths.content_dir.mkdir(parents=True, exist_ok=True)
+        paths.images_dir.mkdir(parents=True, exist_ok=True)
         reader_url = READER_URL.format(book_id=request.book_id)
         state = CrawlState.load(paths.state_path, book_id=request.book_id, reader_url=reader_url)
 
@@ -92,7 +95,7 @@ class WeReadCrawler:
                                 state.save(paths.state_path)
                                 return self._result(False, state.last_error, paths, state)
 
-                    content = await fetcher.extract_chapter_content()
+                    content = await fetcher.extract_chapter_content(images_dir=paths.images_dir)
                     if not content.markdown:
                         state.last_error = "未能提取正文内容；可能需要登录、页面结构变化，或 WRPA hook 尚未捕获到文本。"
                         state.save(paths.state_path)
@@ -115,7 +118,7 @@ class WeReadCrawler:
                     current_index += 1
 
                     if not toc and current_index < total:
-                        moved = await fetcher.go_next(content.markdown)
+                        moved = await fetcher.go_next(content.markdown, images_dir=paths.images_dir)
                         if not moved:
                             state.add_warning("未能自动进入下一页，已停止在当前进度。")
                             break

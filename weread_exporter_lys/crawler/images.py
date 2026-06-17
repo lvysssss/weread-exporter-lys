@@ -29,10 +29,21 @@ class ImageFilter:
         self.seen.add(normalized)
         return normalized
 
-    def markdown_lines(self, urls: list[str], *, base_url: str | None = None) -> list[str]:
+    def markdown_lines(
+        self,
+        urls: list[str],
+        *,
+        base_url: str | None = None,
+        exclude: set[str] | None = None,
+    ) -> list[str]:
+        excluded = exclude or set()
         lines: list[str] = []
         for url in urls:
             kept = self.keep(url, base_url=base_url)
-            if kept is not None:
-                lines.append(f"![]({kept})")
+            if kept is None:
+                continue
+            # Skip rare-char images already inlined into the text by coordinate merge.
+            if any(kept == ex or ex in kept for ex in excluded):
+                continue
+            lines.append(f"![]({kept})")
         return lines
