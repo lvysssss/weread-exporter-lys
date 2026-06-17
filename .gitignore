@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+cache/
+cache_*/
+output/
+.playwright-mcp/
+
+.weread-exporter-lys.json

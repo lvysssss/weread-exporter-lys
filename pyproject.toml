@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weread-exporter-lys"
+version = "0.1.0"
+description = "Export books from WeRead and other reading platforms."
+readme = "设计文档.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "weread-exporter-lys contributors" }]
+dependencies = ["playwright>=1.44.0"]
+
+[project.scripts]
+weread-exporter-lys = "weread_exporter_lys.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["weread_exporter_lys*"]
