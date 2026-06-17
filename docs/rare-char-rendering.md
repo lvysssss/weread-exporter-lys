@@ -160,14 +160,24 @@ const rareChars = Array.from(
  });
 ```
 
-### 5.2 与 canvas 文本对位（已实现）
+### 5.2 与 canvas 文本对位（已实现，行内精确定位）
 
-`hook.js` 现在同时暴露每行的 y 坐标。回插规则（实现于 `extractor.merge_rare_chars`）：
+**坐标空间的关键发现**：canvas 的 `fillText` 坐标是 canvas 内部像素（devicePixelRatio 缩放，实测 scale=3），而生僻字 `<img>` 的 `translate` 是 CSS 像素。两者不在同一空间，直接比较会错位 3 倍——这是 v1"行末追加"虽能工作但无法做行内定位的根因。
 
-1. 收集 canvas 文本行 `{text, y, fontSize, prefix}`（来自 `wrpaHandler.getLinesWithCoords()`）与生僻字图 `{src, data_wr_id, x, y, local_path}`（来自 `fetcher._rare_char_images()` + `_download_rare_chars()`）。
-2. 对每张生僻字图，找 y 绝对差最小的文本行（容差默认 20px）；归属同一行的多张图按 x 升序追加。
-3. 因 canvas 文本在生僻字处直接截断、不留占位符（见 §4），生僻字 token 追加到所属行**末尾**即可还原原文阅读顺序。
-4. 输出 markdown 占位标记为 `![](local_path)`，`local_path` 形如 `../images/{data-wr-id}.png`（相对 `content/{N}.md`）。
+**统一坐标空间**：两者都换算到 **canvas-CSS 空间**（即 canvas 内部坐标 ÷ scale）：
+- 片段坐标：hook 在 `flushLine` 时把每个 `fillText` 的 `x` ÷ scale 存为 `xCss`，行 y ÷ scale 存为 `y`。
+- 图片坐标：`fetcher._rare_char_images()` 把 `translate` 的 x/y ÷ scale（通过 `wrpaHandler.getCanvasScale()` 取 scale）。
+- 换算后两者在同一空间，实测 y 对齐误差 <1.5px，x 落在行内片段间隙中。
+
+**回插规则**（实现于 `extractor.merge_rare_chars`）：
+
+1. 收集 canvas 文本行 `{fragments: [{text, xCss}], y, prefix}`（来自 `wrpaHandler.getLinesWithCoords()`）与生僻字图 `{local_path, x, y}`（÷scale 后的 canvas-CSS 坐标）。
+2. 对每张生僻字图，找 y 绝对差最小的文本行（容差默认 20px）。
+3. **行内插入**：在该行的 `fragments` 序列里，找到第一个 `xCss ≥ 图片.x` 的片段，把 `![](local_path)` 插在它**前面**；若无此片段（图片在行末），追加到行末。这样图落在 canvas 留空的间隙里，精确定位。
+4. 同行多图按 x 升序依次插入，保持阅读顺序。
+5. 输出 markdown 占位标记为 `![](local_path)`，`local_path` 形如 `../images/{data-wr-id}.png`（相对 `content/{N}.md`）。
+
+`hook.js` 新增 `wrpaHandler.getCanvasScale()` 返回 scale；`getLinesWithCoords()` 每行记录新增 `fragments` 字段（保留 `text` 向后兼容）。
 
 ### 5.3 与 `images.py` 的协作（已实现）
 
@@ -183,29 +193,30 @@ const rareChars = Array.from(
 
 ### 已实现
 
-1. **hook.js 暴露行坐标**：新增 `lineRecords` 数组与 `wrpaHandler.getLinesWithCoords()`，返回 `[{text, y, fontSize, minFontSize, prefix}]`。`flushLine()` 同时落字符串行（供 `getMarkdown()` 向后兼容）与结构化记录。`clearMarkdown()` 同步清空。
-2. **生僻字采集**：`fetcher._rare_char_images()` 读取 `.passage-content img.h-pic`（src 含 `wrepub/`），解析 `translate(x,y)`，返回 `[{src, data_wr_id, x, y, width, ratio}]`。
+1. **hook.js 暴露片段级坐标**：`lineRecords` 数组与 `wrpaHandler.getLinesWithCoords()`，返回 `[{text, fragments: [{text, xCss}], y, fontSize, minFontSize, prefix}]`。`flushLine()` 把每个 `fillText` 片段的 x ÷ scale 存为 `xCss`，行 y ÷ scale。新增 `wrpaHandler.getCanvasScale()`。`clearMarkdown()` 同步清空。
+2. **生僻字采集**：`fetcher._rare_char_images()` 读取 `.passage-content img.h-pic`（src 含 `wrepub/`），解析 `translate(x,y)` 并 ÷ scale（取自 `getCanvasScale()`）转成 canvas-CSS 坐标，与片段同空间。
 3. **生僻字下载**：`fetcher._download_rare_chars()` 用 `page.request.get` 下载为 `images/{data-wr-id}.png`，已存在则跳过（resume-safe），补 `local_path` 字段。
-4. **坐标合并**：`extractor.merge_rare_chars(lines, rare_chars)` 纯函数，按 y 最近行末尾内联 `![](local_path)`，同行多字按 x 升序，孤立字（超出容差）追加文末。
+4. **坐标合并（行内插入）**：`extractor.merge_rare_chars(lines, rare_chars)` 纯函数，按 y 匹配行后，在行 `fragments` 序列里按 x 间隙插入 `![](local_path)`——找第一个 `xCss ≥ 图片.x` 的片段插其前，无则行末。无 `fragments` 字段的旧记录回退到行末插入（向后兼容）。
 5. **ImageFilter exclude**：`markdown_lines(..., exclude=)` 跳过已内联 src，避免重复。
 6. **路径与传参**：`WeReadCrawlerPaths` 新增 `images_dir`，`_crawl` 创建之并传给 `extract_chapter_content(images_dir=...)`；`go_next` 同步透传。
 
-**实测结果**（CLI 抓《史记》3.md，五帝本纪第一）：
+**实测结果**（CLI 抓《史记》，行内精确定位）：
 
 ```
-教熊罴貔貅
-[9]![](../images/wrksu7y7ih50s.png)
-虎，以与炎帝战于阪泉
+教熊罴貔貅[]![](../images/wrksu7y7ih50s.png)虎，以与炎帝战于阪泉
+[7]![](../images/wr971ml6xrvti.png)（jú）​：特制的爬山鞋。底下钉有锥形器物…
 ```
 
-生僻字图内联到 `[9]` 脚注后、`虎` 前，与 canvas 文本截断点吻合；`images/` 下 18 张 PNG 全部下载成功。`[9]` 之所以在图前，是因为脚注编号是 canvas 文本末尾、生僻字图正好接在其后——还原顺序正确。
+生僻字图精确插在 canvas 留空的间隙里（`[]` 后、`虎` 前；`[7]` 脚注后、`（jú）` 释义前），不再追加行末。`images/` 下 PNG 全部下载成功。
 
-测试：`python -m unittest discover -s tests` 23 项全绿（含 6 项 `RareCharMergeTests` + 1 项 `exclude` 测试）。
+**坐标空间验证**（canvas scale=3）：图片 `translate(129, 3086)`（CSS）÷ 3 = `(43, 1028.67)`，与该行片段 `y=1029.89`（误差 1.2px）、间隙位置 `](41) < 43 < 虎(51)` 完全吻合。
+
+测试：`python -m unittest discover -s tests` 26 项全绿（含 9 项 `RareCharMergeTests`，覆盖行内插入、行末回退、同行多图、脚注间隙等场景）。
 
 ### 遗留风险
 
-1. **合并精度**：v1 用"y 最近行末尾"近似。若实测发现生僻字应在一行中间（x 表明不在行末），可升级为按 x 在行文本内定位。当前样本验证无需升级。
-2. **滚动模式整章捕获**：滚动模式下 12 个 passage 全在 DOM，canvas 仍按页懒绘制；v1 用逐章翻页提取，每章独立采集本章生僻字，已满足需求。
+1. **行内插入依赖片段坐标**：若某行 `fillText` 把多个字合并成一次调用（而非逐字），`fragments` 会粗粒度，图片可能落到行末而非精确间隙。当前样本逐字绘制，未触发；若遇粗粒度行，图片退化为行末，仍可读但不精确。
+2. **滚动模式整章捕获**：滚动模式下 12 个 passage 全在 DOM，canvas 仍按页懒绘制；逐章翻页提取，每章独立采集本章生僻字，已满足需求。
 3. **跨页生僻字**：y 坐标在章节系内唯一（实测确认），按章 y 排序合并即可，不依赖页边界。
 4. **DOM 分支**：非 WRPA 书的 DOM 模式暂不处理生僻字（innerText 里同样缺失），留 TODO。
 5. **`data-wr-id` → Unicode 还原**：仍属远期，当前直接用图片保真。

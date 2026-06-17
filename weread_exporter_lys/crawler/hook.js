@@ -7,6 +7,10 @@
   const lineRecords = [];
   let lineBuffer = [];
   let currentY = null;
+  // canvas internal-px per CSS-px (devicePixelRatio-like). Captured per canvas
+  // in patchedGetContext; used to convert fillText coords (internal) and <img>
+  // translate coords (CSS) into a common canvas-CSS space.
+  let canvasScale = 1;
 
   function parseFontSize(font) {
     const match = String(font || '').match(/(\d+(?:\.\d+)?)px/);
@@ -23,13 +27,21 @@
     }
 
     lineBuffer.sort((left, right) => left.x - right.x);
-    const text = lineBuffer.map((item) => item.text).join('').trim();
+    const scale = canvasScale || 1;
+    // Keep per-fragment geometry so downstream can interleave rare-char images
+    // by x within the line. Coords are converted to canvas-CSS space (÷ scale)
+    // to match the <img> translate coords from .passage-content.
+    const fragments = lineBuffer.map((item) => ({
+      text: String(item.text || ''),
+      xCss: Math.round((Number(item.x) || 0) / scale * 100) / 100,
+    }));
+    const text = fragments.map((f) => f.text).join('').trim();
     if (text && !isFontProbeLine(text)) {
       const maxFontSize = Math.max(...lineBuffer.map((item) => item.fontSize));
       const minFontSize = Math.min(...lineBuffer.map((item) => item.fontSize));
       // Representative y for the line: the min y of its fragments (top-most),
-      // matching how canvas rows align with the rare-char <img> translate y.
-      const minY = lineBuffer.reduce((acc, item) => Math.min(acc, item.y), Infinity);
+      // in canvas-CSS space so it aligns with rare-char <img> translate y.
+      const minYRaw = lineBuffer.reduce((acc, item) => Math.min(acc, item.y), Infinity);
       let prefix = '';
       if (maxFontSize >= 27) {
         prefix = '## ';
@@ -39,7 +51,8 @@
       lines.push(`${prefix}${text}`);
       lineRecords.push({
         text,
-        y: minY,
+        fragments,
+        y: Math.round(minYRaw / scale * 100) / 100,
         fontSize: maxFontSize,
         minFontSize,
         prefix,
@@ -86,6 +99,15 @@
   HTMLCanvasElement.prototype.getContext = function patchedGetContext(type, ...args) {
     const context = originalGetContext.call(this, type, ...args);
     if (type === '2d') {
+      // Capture the canvas's internal-to-CSS scale once. width is internal px,
+      // getBoundingClientRect().width is CSS px.
+      const rect = this.getBoundingClientRect();
+      if (rect.width > 0 && this.width > 0) {
+        const s = this.width / rect.width;
+        if (s > 0 && Number.isFinite(s)) {
+          canvasScale = s;
+        }
+      }
       return installCanvasHook(context);
     }
     return context;
@@ -114,7 +136,13 @@
     getLinesWithCoords() {
       flushLine();
       // Return a deep-ish copy so callers can't mutate internal state.
-      return lineRecords.map((record) => ({ ...record }));
+      return lineRecords.map((record) => ({
+        ...record,
+        fragments: record.fragments.map((f) => ({ ...f })),
+      }));
+    },
+    getCanvasScale() {
+      return canvasScale;
     },
     clearMarkdown() {
       lines.length = 0;

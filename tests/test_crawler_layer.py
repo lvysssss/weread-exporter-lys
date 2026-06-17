@@ -77,55 +77,91 @@ class ExtractorTests(unittest.TestCase):
 
 
 class RareCharMergeTests(unittest.TestCase):
+    def _line(self, text, y, prefix="", frag_xs=None):
+        """Helper: build a line record with per-fragment xCss (canvas-CSS space).
+
+        If ``frag_xs`` is None, synthesize a single fragment at x=0 so the image
+        falls back to line-end insertion (backward-compat path).
+        """
+        if frag_xs is None:
+            fragments = [{"text": text, "xCss": 0.0}] if text else []
+        else:
+            # Split text into one-char fragments at the given x positions.
+            fragments = [
+                {"text": ch, "xCss": float(x)} for ch, x in zip(text, frag_xs)
+            ]
+        return {"text": text, "fragments": fragments, "y": float(y), "prefix": prefix}
+
     def test_no_rare_chars_returns_lines_unchanged(self):
-        lines = [
-            {"text": "第一行", "y": 100.0, "fontSize": 16, "prefix": ""},
-            {"text": "第二行", "y": 140.0, "fontSize": 16, "prefix": ""},
-        ]
+        lines = [self._line("第一行", 100.0), self._line("第二行", 140.0)]
         self.assertEqual(merge_rare_chars(lines, []), "第一行\n\n第二行")
 
-    def test_appends_rare_char_to_closest_line_by_y(self):
-        # Sample mirrors 《五帝本纪》"熊罴貔貅〔图〕虎": the rare char sits between
-        # the 貔貅 line and the 虎 line; it should attach to the closest one.
-        lines = [
-            {"text": "教熊罴貔貅", "y": 3070.0, "fontSize": 16, "prefix": ""},
-            {"text": "虎，以与炎帝战于阪泉", "y": 3100.0, "fontSize": 16, "prefix": ""},
-        ]
-        rare = [{"local_path": "../images/wrqsm9qrxc61.png", "x": 129.0, "y": 3086.0}]
+    def test_inserts_image_into_x_gap_within_line(self):
+        # Mirrors real data: 教熊罴貔貅[]虎 — the canvas left a gap at x=43
+        # between ](41) and 虎(51). Image x=43 must land there, NOT at line end.
+        frags = [0, 7, 14.33, 21.33, 28.67, 35.67, 41, 51.67, 59]
+        text = "教熊罴貔貅[]虎，"
+        lines = [self._line(text, 1029.89, frag_xs=frags)]
+        rare = [{"local_path": "../images/r.png", "x": 43.0, "y": 1028.67}]
         result = merge_rare_chars(lines, rare)
-        # 3086 is closer to 3100 (dist 14) than 3070 (dist 16) → attaches to 虎 line end.
-        self.assertEqual(
-            result,
-            "教熊罴貔貅\n\n虎，以与炎帝战于阪泉![](../images/wrqsm9qrxc61.png)",
-        )
+        self.assertEqual(result, "教熊罴貔貅[]![](../images/r.png)虎，")
+
+    def test_inserts_image_between_footnote_and_gloss(self):
+        # The user-reported case: image belongs between [3] and ：搅乱。
+        # Fragments: [(0) 3(7) ](14)  <gap>  ：(21) 搅(28) 乱(35) 。(42)
+        # Image x=17 falls in the gap between ](14) and ：(21).
+        frags = [0, 7, 14, 21, 28, 35, 42]
+        text = "[3]：搅乱。"
+        lines = [self._line(text, 100.0, frag_xs=frags)]
+        rare = [{"local_path": "../images/r.png", "x": 17.0, "y": 100.0}]
+        result = merge_rare_chars(lines, rare)
+        self.assertEqual(result, "[3]![](../images/r.png)：搅乱。")
+
+    def test_image_at_line_end_appended_when_no_fragment_to_right(self):
+        frags = [0, 7]
+        text = "正文"
+        lines = [self._line(text, 100.0, frag_xs=frags)]
+        rare = [{"local_path": "../images/r.png", "x": 50.0, "y": 100.0}]
+        result = merge_rare_chars(lines, rare)
+        self.assertEqual(result, "正文![](../images/r.png)")
 
     def test_same_line_multiple_rare_chars_ordered_by_x(self):
-        lines = [{"text": "甲乙", "y": 100.0, "fontSize": 16, "prefix": ""}]
+        frags = [0, 7]
+        text = "甲乙"
+        lines = [self._line(text, 100.0, frag_xs=frags)]
         rare = [
-            {"local_path": "../images/b.png", "x": 300.0, "y": 100.0},
-            {"local_path": "../images/a.png", "x": 129.0, "y": 100.0},
-            {"local_path": "../images/c.png", "x": 458.0, "y": 100.0},
+            {"local_path": "../images/b.png", "x": 30.0, "y": 100.0},
+            {"local_path": "../images/a.png", "x": 15.0, "y": 100.0},
+            {"local_path": "../images/c.png", "x": 45.0, "y": 100.0},
         ]
         result = merge_rare_chars(lines, rare)
         self.assertEqual(result, "甲乙![](../images/a.png)![](../images/b.png)![](../images/c.png)")
 
     def test_preserves_heading_prefix(self):
         lines = [
-            {"text": "第一卷 五帝本纪第一", "y": 50.0, "fontSize": 28, "prefix": "## "},
-            {"text": "正文", "y": 100.0, "fontSize": 16, "prefix": ""},
+            self._line("标题", 50.0, prefix="## ", frag_xs=[0, 7]),
+            self._line("正文", 100.0, frag_xs=[0, 7]),
         ]
-        rare = [{"local_path": "../images/x.png", "x": 10.0, "y": 100.0}]
+        rare = [{"local_path": "../images/x.png", "x": 50.0, "y": 100.0}]
         result = merge_rare_chars(lines, rare)
-        self.assertEqual(result, "## 第一卷 五帝本纪第一\n\n正文![](../images/x.png)")
+        self.assertEqual(result, "## 标题\n\n正文![](../images/x.png)")
 
     def test_orphan_rare_char_beyond_tolerance_appended_at_end(self):
-        lines = [{"text": "正文", "y": 100.0, "fontSize": 16, "prefix": ""}]
+        lines = [self._line("正文", 100.0, frag_xs=[0, 7])]
         rare = [{"local_path": "../images/far.png", "x": 10.0, "y": 5000.0}]
         result = merge_rare_chars(lines, rare, line_tolerance=20.0)
         self.assertEqual(result, "正文\n\n![](../images/far.png)")
 
     def test_empty_lines_returns_empty(self):
         self.assertEqual(merge_rare_chars([], [{"local_path": "../images/x.png", "x": 0, "y": 0}]), "")
+
+    def test_backward_compat_no_fragments_falls_back_to_line_end(self):
+        # Records without `fragments` (old hook output) still work: image → line end.
+        lines = [{"text": "正文", "y": 100.0, "prefix": ""}]
+        rare = [{"local_path": "../images/r.png", "x": 50.0, "y": 100.0}]
+        result = merge_rare_chars(lines, rare)
+        self.assertEqual(result, "正文![](../images/r.png)")
+
 
 
 

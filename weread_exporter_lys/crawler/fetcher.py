@@ -445,12 +445,15 @@ class WeReadPageFetcher:
 
         Targets ``.passage-content img.h-pic`` whose ``src`` points at the
         unencrypted rare-char asset host (``res.weread.qq.com/wrepub/``). Each
-        returned record carries the parsed ``translate(x, y)`` so the caller can
-        merge the image into the canvas text flow by y.
+        returned record carries the parsed ``translate(x, y)`` converted from
+        CSS space to canvas-CSS space (÷ canvas scale) so it aligns with the
+        fragment coordinates from ``wrpaHandler.getLinesWithCoords()``.
         """
         records = await self.page.evaluate(
             """
             () => {
+              const scale = (window.wrpaHandler && window.wrpaHandler.getCanvasScale)
+                ? window.wrpaHandler.getCanvasScale() : 1;
               const out = [];
               const imgs = document.querySelectorAll(
                 '.passage-content img.h-pic'
@@ -462,11 +465,20 @@ class WeReadPageFetcher:
                 const m = transform.match(
                   /translate\\(\\s*([-\\d.]+)px\\s*,\\s*([-\\d.]+)px\\s*\\)/
                 );
+                const xCss = m ? parseFloat(m[1]) : null;
+                const yCss = m ? parseFloat(m[2]) : null;
                 out.push({
                   src: src,
                   data_wr_id: img.getAttribute('data-wr-id') || null,
-                  x: m ? parseFloat(m[1]) : null,
-                  y: m ? parseFloat(m[2]) : null,
+                  // Convert CSS translate (px) to canvas-CSS space to match
+                  // fragment xCss/y from getLinesWithCoords (which are already
+                  // canvas-internal ÷ scale). The <img> lives in the same
+                  // chapter coordinate space as the canvas, just at CSS scale.
+                  x: (xCss != null) ? Math.round(xCss / scale * 100) / 100 : null,
+                  y: (yCss != null) ? Math.round(yCss / scale * 100) / 100 : null,
+                  xCss: xCss,
+                  yCss: yCss,
+                  scale: scale,
                   width: img.getAttribute('data-w') || null,
                   ratio: img.getAttribute('data-ratio') || null,
                 });
