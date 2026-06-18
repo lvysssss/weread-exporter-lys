@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 
 from .base import BookPlatform, ExportRequest, ExportResult
 from ..crawler.weread import WeReadCrawler
+from ..processing.pipeline import ProcessingPipeline
 
 BOOK_ID_PATTERN = re.compile(r"^[0-9A-Za-z_-]+$")
 
@@ -32,11 +33,24 @@ class WeReadPlatform(BookPlatform):
         message = crawler_result.message
         if crawler_result.warnings:
             message = message + "\n" + "\n".join(f"警告：{warning}" for warning in crawler_result.warnings)
-        return ExportResult(
-            ok=crawler_result.ok,
-            message=message,
-            output_path=crawler_result.content_dir if crawler_result.ok else None,
-        )
+
+        if not crawler_result.ok:
+            return ExportResult(ok=False, message=message)
+
+        # ---- Run the processing pipeline (preprocess → merge → postprocess → convert) ----
+        output_path = crawler_result.content_dir  # fallback: raw markdown
+        try:
+            pipeline = ProcessingPipeline(request)
+            final_path = pipeline.run()
+            if final_path is not None:
+                output_path = final_path
+                message = message + f"\n处理完成，输出文件：{output_path}"
+            else:
+                message = message + "\n处理层未生成最终文件，保留原始 Markdown。"
+        except Exception as exc:
+            message = message + f"\n处理层执行失败：{exc}\n已保留原始 Markdown：{output_path}"
+
+        return ExportResult(ok=True, message=message, output_path=output_path)
 
     def _validate_book_id(self, book_id: str) -> str:
         if not BOOK_ID_PATTERN.fullmatch(book_id):

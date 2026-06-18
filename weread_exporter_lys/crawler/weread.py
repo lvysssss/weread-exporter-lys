@@ -37,6 +37,22 @@ class WeReadCrawler:
         callback = on_progress or request.on_progress
         return run_async(self._crawl(request, callback))
 
+    @staticmethod
+    def _max_saved_chapter(content_dir: Path) -> int:
+        """Return the highest chapter number saved on disk, or 0 if none."""
+        if not content_dir.is_dir():
+            return 0
+        max_n = 0
+        for f in content_dir.iterdir():
+            if f.is_file() and f.suffix == ".md":
+                try:
+                    n = int(f.stem)
+                    if n > max_n:
+                        max_n = n
+                except ValueError:
+                    pass
+        return max_n
+
     def paths_for(self, request: ExportRequest) -> WeReadCrawlerPaths:
         book_dir = request.cache_dir / request.book_id
         auth_state_path = request.auth_state_path or request.cache_dir / "auth" / "weread-storage-state.json"
@@ -104,7 +120,11 @@ class WeReadCrawler:
 
                 total = len(toc) if toc else 1
                 emit(on_progress, ProgressEvent(kind="started", total=total))
-                current_index = max(0, state.current_chapter_index)
+                # Resume from the highest saved chapter file on disk, not from
+                # state.json.  This lets users delete/reorder chapter files to
+                # control where the crawl picks up — e.g. deleting 50.md–100.md
+                # will cause those chapters to be re-fetched.
+                current_index = self._max_saved_chapter(paths.content_dir)
 
                 while current_index < total:
                     chapter_title = toc[current_index].get("title") if toc else None
