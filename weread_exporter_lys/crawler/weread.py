@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..progress import ProgressCallback, ProgressEvent, emit
 from .fetcher import READER_URL, LoginRequiredError, PlaywrightUnavailableError, WeReadPageFetcher, run_async, write_json
 from .state import CrawlState
 
@@ -32,8 +33,9 @@ class WeReadCrawlerPaths:
 
 
 class WeReadCrawler:
-    def crawl(self, request: ExportRequest) -> WeReadCrawlerResult:
-        return run_async(self._crawl(request))
+    def crawl(self, request: ExportRequest, on_progress: ProgressCallback | None = None) -> WeReadCrawlerResult:
+        callback = on_progress or request.on_progress
+        return run_async(self._crawl(request, callback))
 
     def paths_for(self, request: ExportRequest) -> WeReadCrawlerPaths:
         book_dir = request.cache_dir / request.book_id
@@ -48,18 +50,29 @@ class WeReadCrawler:
             auth_state_path=auth_state_path,
         )
 
-    async def _crawl(self, request: ExportRequest) -> WeReadCrawlerResult:
+    async def _crawl(self, request: ExportRequest, on_progress: ProgressCallback | None = None) -> WeReadCrawlerResult:
         paths = self.paths_for(request)
         paths.content_dir.mkdir(parents=True, exist_ok=True)
         paths.images_dir.mkdir(parents=True, exist_ok=True)
         reader_url = READER_URL.format(book_id=request.book_id)
         state = CrawlState.load(paths.state_path, book_id=request.book_id, reader_url=reader_url)
 
+        def warn(message: str) -> None:
+            # Only surface a warning once per crawl — repeated identical
+            # messages (e.g. "检测到 WRPA" on every chapter) just clutter the
+            # progress line. CrawlState.add_warning already de-dups state, so
+            # we gate the event on the same check.
+            if message in state.warnings:
+                return
+            state.add_warning(message)
+            emit(on_progress, ProgressEvent(kind="warning", message=message))
+
         try:
             async with WeReadPageFetcher(
                 headless=request.headless,
                 delay=request.delay,
                 auth_state_path=paths.auth_state_path,
+                on_progress=on_progress,
             ) as fetcher:
                 await fetcher.goto_reader(request.book_id)
                 await fetcher.ensure_logged_in()
@@ -67,24 +80,41 @@ class WeReadCrawler:
                 if await fetcher.has_blocking_paywall():
                     state.last_error = "页面提示试读结束、购买、会员或登录后可读，请先在浏览器中确认访问权限。"
                     state.save(paths.state_path)
-                    return self._result(False, state.last_error, paths, state)
+                    return self._finish(False, state.last_error, paths, state, on_progress)
 
                 if not paths.cover_path.exists():
                     cover_saved = await fetcher.save_cover(paths.cover_path)
+                    emit(on_progress, ProgressEvent(
+                        kind="cover", ok=cover_saved,
+                        message="保存封面 ✓" if cover_saved else "未找到封面，已跳过封面保存。",
+                    ))
                     if not cover_saved:
-                        state.add_warning("未找到封面，已跳过封面保存。")
+                        warn("未找到封面，已跳过封面保存。")
+                else:
+                    emit(on_progress, ProgressEvent(kind="cover", ok=True, message="封面已存在，跳过保存。"))
 
                 toc = await fetcher.extract_toc()
                 if toc:
                     write_json(paths.toc_path, toc)
                     state.toc_path = str(paths.toc_path)
+                    emit(on_progress, ProgressEvent(kind="toc", total=len(toc)))
                 else:
-                    state.add_warning("未能从页面提取目录，将只保存当前可见正文。")
+                    warn("未能从页面提取目录，将只保存当前可见正文。")
+                    emit(on_progress, ProgressEvent(kind="toc", total=1))
 
                 total = len(toc) if toc else 1
+                emit(on_progress, ProgressEvent(kind="started", total=total))
                 current_index = max(0, state.current_chapter_index)
 
                 while current_index < total:
+                    chapter_title = toc[current_index].get("title") if toc else None
+                    emit(on_progress, ProgressEvent(
+                        kind="chapter_started",
+                        index=current_index + 1,
+                        total=total,
+                        title=chapter_title,
+                    ))
+
                     if toc:
                         await fetcher.clear_wrpa_markdown()
                         if not await fetcher.goto_toc_item(current_index):
@@ -93,16 +123,15 @@ class WeReadCrawler:
                             if not await fetcher.goto_toc_item(current_index):
                                 state.last_error = f"未能点击目录第 {current_index + 1} 项。"
                                 state.save(paths.state_path)
-                                return self._result(False, state.last_error, paths, state)
+                                return self._finish(False, state.last_error, paths, state, on_progress)
 
-                    content = await fetcher.extract_chapter_content(images_dir=paths.images_dir)
+                    content = await fetcher.extract_full_chapter(images_dir=paths.images_dir)
                     if not content.markdown:
                         state.last_error = "未能提取正文内容；可能需要登录、页面结构变化，或 WRPA hook 尚未捕获到文本。"
                         state.save(paths.state_path)
-                        return self._result(False, state.last_error, paths, state)
+                        return self._finish(False, state.last_error, paths, state, on_progress)
 
                     chapter_path = paths.content_dir / f"{current_index + 1}.md"
-                    chapter_title = toc[current_index].get("title") if toc else None
                     chapter_text = content.markdown
                     if chapter_title and not chapter_text.startswith(str(chapter_title)):
                         chapter_text = f"# {chapter_title}\n\n{chapter_text}"
@@ -112,32 +141,53 @@ class WeReadCrawler:
                     state.last_error = None
 
                     if content.anti_crawl_status and content.anti_crawl_status.get("hasWRPA"):
-                        state.add_warning("检测到 WRPA；已使用 Canvas hook 初版尝试提取文本，图片解密将在后续处理。")
+                        warn("检测到 WRPA；已使用 Canvas hook 初版尝试提取文本，图片解密将在后续处理。")
 
                     state.save(paths.state_path)
+                    emit(on_progress, ProgressEvent(
+                        kind="chapter_saved",
+                        index=current_index + 1,
+                        total=total,
+                        title=chapter_title,
+                    ))
                     current_index += 1
 
                     if not toc and current_index < total:
                         moved = await fetcher.go_next(content.markdown, images_dir=paths.images_dir)
                         if not moved:
-                            state.add_warning("未能自动进入下一页，已停止在当前进度。")
+                            warn("未能自动进入下一页，已停止在当前进度。")
                             break
 
                 await fetcher.save_auth_state()
-                return self._result(True, f"爬虫层完成，正文已保存到：{paths.content_dir}", paths, state)
+                return self._finish(
+                    True,
+                    f"爬虫层完成，正文已保存到：{paths.content_dir}",
+                    paths, state, on_progress,
+                )
         except LoginRequiredError as error:
             state.last_error = str(error)
             state.save(paths.state_path)
-            return self._result(False, str(error), paths, state)
+            return self._finish(False, str(error), paths, state, on_progress)
         except PlaywrightUnavailableError as error:
             state.last_error = str(error)
             state.save(paths.state_path)
-            return self._result(False, str(error), paths, state)
+            return self._finish(False, str(error), paths, state, on_progress)
         except Exception as error:
             message = f"爬虫执行失败：{error}"
             state.last_error = message
             state.save(paths.state_path)
-            return self._result(False, message, paths, state)
+            return self._finish(False, message, paths, state, on_progress)
+
+    def _finish(
+        self,
+        ok: bool,
+        message: str,
+        paths: WeReadCrawlerPaths,
+        state: CrawlState,
+        on_progress: ProgressCallback | None = None,
+    ) -> WeReadCrawlerResult:
+        emit(on_progress, ProgressEvent(kind="finished", ok=ok, message=message))
+        return self._result(ok, message, paths, state)
 
     def _result(
         self,

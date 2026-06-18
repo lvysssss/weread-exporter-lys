@@ -1,14 +1,18 @@
+import asyncio
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from weread_exporter_lys.crawler.extractor import html_text_to_markdown, merge_rare_chars, normalize_markdown_text
+from weread_exporter_lys.crawler.fetcher import WeReadPageFetcher
 from weread_exporter_lys.crawler.images import ImageFilter
 from weread_exporter_lys.crawler.state import CrawlState
 from weread_exporter_lys.crawler.weread import WeReadCrawler, WeReadCrawlerResult
 from weread_exporter_lys.platforms.base import ExportRequest
 from weread_exporter_lys.platforms.weread import WeReadPlatform
+from weread_exporter_lys.progress import ProgressEvent, ProgressRenderer
 
 
 class CrawlStateTests(unittest.TestCase):
@@ -249,6 +253,358 @@ class WeReadPlatformCrawlerTests(unittest.TestCase):
             headless=True,
             auth_state_path=Path("auth.json"),
         )
+
+
+class ProgressRendererTests(unittest.TestCase):
+    def _renderer(self, is_tty=True):
+        stream = io.StringIO()
+        renderer = ProgressRenderer(stream=stream, is_tty=is_tty)
+        return renderer, stream
+
+    def test_renders_chapter_progress_with_percentage(self):
+        renderer, stream = self._renderer(is_tty=True)
+        renderer.handle(ProgressEvent(kind="started", total=50))
+        renderer.handle(ProgressEvent(kind="chapter_started", index=3, total=50, title="第一章 引言"))
+        renderer.handle(ProgressEvent(kind="finished", ok=True, message="done"))
+        out = stream.getvalue()
+        self.assertIn("[3/50]", out)
+        self.assertIn("第一章 引言", out)
+        self.assertIn("6%", out)  # 3/50 = 6%
+        # finished must terminate the progress line with a newline
+        self.assertTrue(out.rstrip().endswith("\n") or out.endswith("\n"))
+
+    def test_tty_overwrites_with_carriage_return(self):
+        renderer, stream = self._renderer(is_tty=True)
+        renderer.handle(ProgressEvent(kind="started", total=4))
+        renderer.handle(ProgressEvent(kind="chapter_started", index=1, total=4, title="A"))
+        renderer.handle(ProgressEvent(kind="chapter_started", index=2, total=4, title="B"))
+        out = stream.getvalue()
+        # Each redraw is prefixed by \r so the line is overwritten, not appended.
+        self.assertEqual(out.count("\r"), 3)
+
+    def test_non_tty_suppresses_progress_line(self):
+        renderer, stream = self._renderer(is_tty=False)
+        renderer.handle(ProgressEvent(kind="started", total=4))
+        renderer.handle(ProgressEvent(kind="chapter_started", index=1, total=4, title="A"))
+        renderer.handle(ProgressEvent(kind="chapter_saved", index=1, total=4, title="A"))
+        renderer.handle(ProgressEvent(kind="warning", message="小心"))
+        renderer.handle(ProgressEvent(kind="finished", ok=True, message="done"))
+        out = stream.getvalue()
+        # No progress bar, but warnings still print (on their own line).
+        self.assertNotIn("\r", out)
+        self.assertIn("警告：小心", out)
+
+    def test_warning_breaks_line_then_redraws_progress(self):
+        renderer, stream = self._renderer(is_tty=True)
+        renderer.handle(ProgressEvent(kind="started", total=4))
+        renderer.handle(ProgressEvent(kind="chapter_started", index=2, total=4, title="正文"))
+        renderer.handle(ProgressEvent(kind="warning", message="检测到 WRPA"))
+        out = stream.getvalue()
+        self.assertIn("警告：检测到 WRPA", out)
+        # After the warning the current chapter progress should be redrawn.
+        self.assertIn("[2/4]", out)
+
+
+class CrawlerProgressEventsTests(unittest.TestCase):
+    """Verify _crawl emits the expected event sequence to on_progress."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _request(self, callback=None):
+        return ExportRequest(
+            platform="weread",
+            book_id="book1",
+            output_format="md",
+            cache_dir=self.cache,
+            output_dir=self.cache / "out",
+            delay=0,
+            headless=True,
+            on_progress=callback,
+        )
+
+    def _run_crawl(self, fetcher_cls):
+        """Drive WeReadCrawler._crawl with a stubbed fetcher class.
+
+        The stub implements the async context-manager protocol itself so the
+        crawler's ``async with WeReadPageFetcher(...) as fetcher`` resolves to
+        the stub instance without launching a real browser.
+        """
+        events: list[ProgressEvent] = []
+        request = self._request(callback=events.append)
+        crawler = WeReadCrawler()
+
+        with patch("weread_exporter_lys.crawler.weread.WeReadPageFetcher", fetcher_cls):
+            asyncio.run(crawler._crawl(request, on_progress=events.append))
+        return events
+
+    def test_emits_started_chapter_started_saved_finished(self):
+        class FakeFetcher:
+            def __init__(self, **kwargs):
+                self.on_progress = kwargs.get("on_progress")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def goto_reader(self, book_id):
+                return None
+
+            async def ensure_logged_in(self):
+                return None
+
+            async def has_blocking_paywall(self):
+                return False
+
+            async def save_cover(self, target):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"x")
+                return True
+
+            async def extract_toc(self):
+                return [{"index": 0, "title": "封面", "level": 1},
+                        {"index": 1, "title": "第一章", "level": 1}]
+
+            async def clear_wrpa_markdown(self):
+                return None
+
+            async def goto_toc_item(self, index):
+                return True
+
+            async def extract_chapter_content(self, *, images_dir=None):
+                from weread_exporter_lys.crawler.extractor import ChapterContent
+                return ChapterContent(markdown=f"正文{images_dir}", source="dom",
+                                      anti_crawl_status={"hasWRPA": False})
+
+            async def extract_full_chapter(self, *, images_dir=None):
+                from weread_exporter_lys.crawler.extractor import ChapterContent
+                return ChapterContent(markdown=f"正文{images_dir}", source="dom",
+                                      anti_crawl_status={"hasWRPA": False})
+
+            async def save_auth_state(self):
+                return None
+
+            async def go_next(self, previous_markdown, *, images_dir=None):
+                return True
+
+        events = self._run_crawl(FakeFetcher)
+        kinds = [e.kind for e in events]
+        # Cover + toc + started, then per-chapter started/saved pairs, then finished.
+        self.assertIn("cover", kinds)
+        self.assertIn("toc", kinds)
+        self.assertEqual(kinds[kinds.index("toc") + 1], "started")
+        self.assertEqual(kinds[-1], "finished")
+        # Two chapters => two chapter_started + two chapter_saved events.
+        self.assertEqual(kinds.count("chapter_started"), 2)
+        self.assertEqual(kinds.count("chapter_saved"), 2)
+        # chapter_started for index 1 carries the right title.
+        first_started = next(e for e in events if e.kind == "chapter_started")
+        self.assertEqual(first_started.index, 1)
+        self.assertEqual(first_started.total, 2)
+        self.assertEqual(first_started.title, "封面")
+        last_saved = [e for e in events if e.kind == "chapter_saved"][-1]
+        self.assertEqual(last_saved.index, 2)
+
+    def test_finished_emitted_on_paywall_failure(self):
+        class FakeFetcher:
+            def __init__(self, **kwargs):
+                self.on_progress = kwargs.get("on_progress")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def goto_reader(self, book_id):
+                return None
+
+            async def ensure_logged_in(self):
+                return None
+
+            async def has_blocking_paywall(self):
+                return True
+
+            async def save_auth_state(self):
+                return None
+
+        events = self._run_crawl(FakeFetcher)
+        finished = [e for e in events if e.kind == "finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertFalse(finished[0].ok)
+        self.assertIn("试读结束", finished[0].message or "")
+
+
+class FetcherWaitingEventsTests(unittest.TestCase):
+    """Verify the fetcher emits ``waiting`` events at long-running points."""
+
+    def test_wait_for_chapter_render_emits_waiting(self):
+        events: list[ProgressEvent] = []
+        fetcher = WeReadPageFetcher.__new__(WeReadPageFetcher)
+        fetcher.on_progress = events.append
+        fetcher.delay = 0
+
+        async def fake_evaluate(self_p, script, *args, **kwargs):
+            # Return a render-stable signal immediately so the loop exits fast.
+            if isinstance(script, str) and "getMarkdown" in script:
+                return "x" * 100
+            return True
+
+        class FakeLoop:
+            def time(self):
+                # Make every deadline check return a time past the deadline so
+                # both poll phases exit immediately after one iteration.
+                return 1_000_000.0
+
+        # Supply a dummy page whose evaluate resolves the render-stable check.
+        fetcher._page = type("P", (), {"evaluate": fake_evaluate})()
+        with patch("asyncio.get_event_loop", return_value=FakeLoop()):
+            asyncio.run(fetcher.wait_for_chapter_render(timeout=0.01))
+
+        waiting = [e for e in events if e.kind == "waiting"]
+        self.assertTrue(any("canvas" in (e.message or "") for e in waiting))
+
+    def test_download_rare_chars_emits_waiting_progress(self):
+        events: list[ProgressEvent] = []
+        fetcher = WeReadPageFetcher.__new__(WeReadPageFetcher)
+        fetcher.on_progress = events.append
+
+        class FakeResponse:
+            ok = True
+
+            async def body(self):
+                return b"x"
+
+        class FakeRequest:
+            async def get(self, src):
+                return FakeResponse()
+
+        fetcher._page = type("P", (), {"request": FakeRequest()})()
+        with tempfile.TemporaryDirectory() as d:
+            images_dir = Path(d) / "images"
+            rare = [{"src": "https://res.weread.qq.com/wrepub/a", "data_wr_id": "r1"},
+                    {"src": "https://res.weread.qq.com/wrepub/b", "data_wr_id": "r2"}]
+            asyncio.run(fetcher._download_rare_chars(rare, images_dir))
+
+        waiting = [e for e in events if e.kind == "waiting"]
+        messages = [e.message for e in waiting]
+        self.assertTrue(any("0/2" in m for m in messages))
+        self.assertTrue(any("2/2" in m for m in messages))
+
+    def _make_fetcher(self, events):
+        fetcher = WeReadPageFetcher.__new__(WeReadPageFetcher)
+        fetcher.on_progress = events.append
+        fetcher.delay = 0
+        return fetcher
+
+    def test_wait_for_chapter_render_waits_for_complete(self):
+        """Multi-batch chapter: __wrpaRenderComplete flips to true after a few
+        polls; the fetcher must keep waiting until it does."""
+        events: list[ProgressEvent] = []
+        fetcher = self._make_fetcher(events)
+
+        # Sequence of evaluate results: complete=False x2, then True.
+        complete_returns = iter([False, False, True])
+
+        async def fake_evaluate(self_p, script, *a, **kw):
+            s = script if isinstance(script, str) else ""
+            if "__wrpaRenderComplete" in s:
+                return next(complete_returns)
+            if "getMarkdown" in s:
+                return "x" * 50  # below 80 so the stable-fallback path is skipped
+            if "__wrpaRenderStable" in s:
+                return True
+            return None
+
+        class FakeLoop:
+            _t = [0.0]
+
+            def time(self):
+                return self._t[0]
+
+        async def fake_sleep(d):
+            FakeLoop._t[0] += d
+
+        fetcher._page = type("P", (), {"evaluate": fake_evaluate})()
+        with patch("asyncio.get_event_loop", return_value=FakeLoop()), \
+             patch("asyncio.sleep", fake_sleep):
+            result = asyncio.run(fetcher.wait_for_chapter_render(timeout=30.0))
+
+        self.assertTrue(result)
+        waiting = [e for e in events if e.kind == "waiting"]
+        self.assertTrue(any("canvas" in (e.message or "") for e in waiting))
+
+    def test_wait_for_chapter_render_falls_back_to_stable(self):
+        """Single-batch short chapter: __wrpaRenderComplete never fires, but
+        render-stable + >80 chars should be accepted as a fallback."""
+        events: list[ProgressEvent] = []
+        fetcher = self._make_fetcher(events)
+
+        async def fake_evaluate(self_p, script, *a, **kw):
+            s = script if isinstance(script, str) else ""
+            if "__wrpaRenderComplete" in s:
+                return False
+            if "getMarkdown" in s:
+                return "y" * 100
+            if "__wrpaRenderStable" in s:
+                return True
+            return None
+
+        class FakeLoop:
+            _t = [0.0]
+
+            def time(self):
+                return self._t[0]
+
+        async def fake_sleep(d):
+            FakeLoop._t[0] += d
+
+        fetcher._page = type("P", (), {"evaluate": fake_evaluate})()
+        with patch("asyncio.get_event_loop", return_value=FakeLoop()), \
+             patch("asyncio.sleep", fake_sleep):
+            result = asyncio.run(fetcher.wait_for_chapter_render(timeout=30.0))
+
+        self.assertTrue(result)
+
+    def test_wait_for_chapter_render_timeout(self):
+        """Neither complete nor a usable stable signal: must time out and
+        return False without looping forever."""
+        events: list[ProgressEvent] = []
+        fetcher = self._make_fetcher(events)
+
+        async def fake_evaluate(self_p, script, *a, **kw):
+            s = script if isinstance(script, str) else ""
+            if "__wrpaRenderComplete" in s:
+                return False
+            if "getMarkdown" in s:
+                return ""  # empty text → stable fallback skipped
+            if "__wrpaRenderStable" in s:
+                return False
+            return None
+
+        # Time advances each call; deadline = time()+0.01, so after one poll
+        # the clock passes the deadline and the loop exits.
+        class FakeLoop:
+            _t = [0.0]
+
+            def time(self):
+                return self._t[0]
+
+        async def fake_sleep(d):
+            FakeLoop._t[0] += 1.0  # jump past the small timeout
+
+        fetcher._page = type("P", (), {"evaluate": fake_evaluate})()
+        with patch("asyncio.get_event_loop", return_value=FakeLoop()), \
+             patch("asyncio.sleep", fake_sleep):
+            result = asyncio.run(fetcher.wait_for_chapter_render(timeout=0.01))
+
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":

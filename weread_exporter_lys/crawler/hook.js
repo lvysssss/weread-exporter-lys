@@ -88,6 +88,15 @@
     context.restore = function patchedRestore(...args) {
       flushLine();
       _onRenderActivity();
+
+      // Mark the page render complete 1500 ms after the last restore. Used
+      // by fetcher to wait for a page's canvas to finish rendering.
+      window.__wrpaRenderComplete = false;
+      if (_completeTimer) clearTimeout(_completeTimer);
+      _completeTimer = setTimeout(() => {
+        window.__wrpaRenderComplete = true;
+      }, 1500);
+
       return originalRestore.call(this, ...args);
     };
 
@@ -114,6 +123,7 @@
   };
 
   let _renderTimer = null;
+  let _completeTimer = null;
   function _onRenderActivity() {
     window.__wrpaRenderStable = false;
     if (_renderTimer) clearTimeout(_renderTimer);
@@ -131,7 +141,16 @@
     },
     getMarkdown() {
       flushLine();
-      return Array.from(new Set(lines)).join('\n\n');
+      // Note: do NOT dedupe via Set — comment markers like "[1]", "[2]" recur
+      // across multiple 原文/注释 sections within a chapter and must be kept.
+      // Adjacent duplicates (from canvas re-renders) are collapsed instead.
+      const out = [];
+      let prev = null;
+      for (const ln of lines) {
+        if (ln !== prev) out.push(ln);
+        prev = ln;
+      }
+      return out.join('\n\n');
     },
     getLinesWithCoords() {
       flushLine();
@@ -150,6 +169,11 @@
       lineBuffer.length = 0;
       currentY = null;
       window.__wrpaRenderStable = false;
+      window.__wrpaRenderComplete = false;
+      if (_completeTimer) {
+        clearTimeout(_completeTimer);
+        _completeTimer = null;
+      }
     },
     getAntiCrawlStatus() {
       flushLine();

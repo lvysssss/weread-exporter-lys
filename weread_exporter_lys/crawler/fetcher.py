@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..progress import ProgressCallback, ProgressEvent, emit
 from .extractor import (
     BODY_SELECTORS,
     IMAGE_SELECTORS,
@@ -18,6 +19,18 @@ READER_URL = "https://weread.qq.com/web/reader/{book_id}"
 HOOK_PATH = Path(__file__).with_name("hook.js")
 
 
+def _looks_like_css(text: str) -> bool:
+    """Heuristic: WRPA 正文页的 DOM 文本来自 .preRenderContainer，是样式垃圾
+    （形如 ``.readerChapterContent .ccn-x{border-left:14.6667px solid ...}``）。
+    正常章节文本不会密集出现 ``{`` ``}`` ``:`` ``;``。当这些符号占比高时判为 CSS。
+    """
+    if not text:
+        return False
+    css_chars = text.count("{") + text.count("}") + text.count(";")
+    # 比例阈值：CSS 里这些符号密集；正文几乎不出现。按 ~每 40 字符 1 个判为垃圾。
+    return css_chars > 0 and len(text) / css_chars < 40
+
+
 class PlaywrightUnavailableError(RuntimeError):
     pass
 
@@ -27,11 +40,12 @@ class LoginRequiredError(RuntimeError):
 
 
 class WeReadPageFetcher:
-    def __init__(self, *, headless: bool, delay: float, auth_state_path: Path | None = None, login_timeout: float = 180.0):
+    def __init__(self, *, headless: bool, delay: float, auth_state_path: Path | None = None, login_timeout: float = 180.0, on_progress: ProgressCallback | None = None):
         self.headless = headless
         self.delay = delay
         self.auth_state_path = auth_state_path
         self.login_timeout = login_timeout
+        self.on_progress = on_progress
 
     async def __aenter__(self) -> "WeReadPageFetcher":
         try:
@@ -70,6 +84,15 @@ class WeReadPageFetcher:
     def page(self):
         return self._page
 
+    def _emit_waiting(self, message: str) -> None:
+        """Emit a ``waiting`` progress event for a long-running step.
+
+        The current chapter index/title is supplied by the crawler via the
+        ``chapter_started`` event; here we only forward the human-readable
+        ``message`` so the renderer can show ``[N/total] 标题 · message``.
+        """
+        emit(self.on_progress, ProgressEvent(kind="waiting", message=message))
+
     async def _launch_browser(self):
         try:
             return await self._playwright.chromium.launch(headless=self.headless)
@@ -100,6 +123,7 @@ class WeReadPageFetcher:
             )
 
         print("检测到需要登录微信读书。请在打开的 Chrome 窗口中扫码/确认登录，登录成功后程序会自动继续。")
+        self._emit_waiting("等待微信扫码登录...")
         await self.page.wait_for_function(
             """
             () => {
@@ -220,6 +244,7 @@ class WeReadPageFetcher:
         await self.page.wait_for_timeout(int(self.delay * 1000) + 3000)
 
         # Poll via JS — Playwright visibility check can miss off-screen catalog items
+        self._emit_waiting("正在展开目录...")
         for _ in range(10):
             found = await self.page.evaluate(
                 "() => !!document.querySelector('.readerCatalog .readerCatalog_list_item')"
@@ -259,41 +284,35 @@ class WeReadPageFetcher:
         except Exception:
             return False
 
-    async def wait_for_chapter_render(self, timeout: float = 5.0) -> bool:
-        """Wait for WRPA canvas to finish rendering chapter text.
+    async def wait_for_chapter_render(self, timeout: float = 30.0) -> bool:
+        """Wait for WRPA canvas to finish rendering the FULL chapter.
 
-        Uses the hook's render-stability signal (300 ms debounce after last
-        fillText) to avoid unnecessary polling.  Falls back to polling every
-        150 ms while the canvas is still active.
+        The hook's restore handler scrolls to bottom after each batch, driving
+        the reader to render subsequent batches. ``__wrpaRenderComplete`` is
+        set 1500 ms after the last restore (i.e. no new batches arrived).
+        Falls back to the render-stable signal plus non-trivial text length
+        for short single-batch chapters where the complete flag may never
+        fire (e.g. hook installed after the only batch finished).
         """
         deadline = asyncio.get_event_loop().time() + timeout
-        # Fast-poll phase (150 ms) — catch render-stable signal or early text
-        fast_until = asyncio.get_event_loop().time() + 2.0
-        while asyncio.get_event_loop().time() < fast_until:
-            stable = await self.page.evaluate(
-                "() => window.__wrpaRenderStable === true"
-            )
-            if stable:
-                return True
-            text = await self.page.evaluate(
-                "() => window.wrpaHandler ? window.wrpaHandler.getMarkdown() : ''"
-            )
-            if text and len(text) > 80 and not text.startswith(".readerChapterContent"):
-                return True
-            await asyncio.sleep(0.15)
-        # Slow-poll phase after 2 s
+        self._emit_waiting("等待整章 canvas 渲染...")
         while asyncio.get_event_loop().time() < deadline:
+            if await self.page.evaluate("() => window.__wrpaRenderComplete === true"):
+                return True
             stable = await self.page.evaluate(
                 "() => window.__wrpaRenderStable === true"
             )
-            if stable:
-                return True
             text = await self.page.evaluate(
                 "() => window.wrpaHandler ? window.wrpaHandler.getMarkdown() : ''"
             )
-            if text and len(text) > 40 and not text.startswith(".readerChapterContent"):
+            if stable and text and len(text) > 80 and not text.startswith(".readerChapterContent"):
+                # Single-batch chapter: give complete a moment to fire, then
+                # accept the render-stable signal as a fallback.
+                await asyncio.sleep(0.5)
+                if await self.page.evaluate("() => window.__wrpaRenderComplete === true"):
+                    return True
                 return True
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
         return False
 
     async def clear_wrpa_markdown(self) -> None:
@@ -339,10 +358,12 @@ class WeReadPageFetcher:
             else:
                 wrpa_markdown = html_text_to_markdown(wrpa_markdown, images, base_url=self.page.url)
 
-            # Fallback to DOM if WRPA canvas has no text (flyleaf / section header pages)
+            # Fallback to DOM if WRPA canvas has no text (flyleaf / section header
+            # pages). Reject DOM text that looks like CSS (WRPA正文页的 DOM 是
+            # .preRenderContainer 的样式垃圾，绝不能当正文)。
             if not wrpa_markdown or len(wrpa_markdown) < 30:
                 text = await self._first_text(BODY_SELECTORS)
-                if text and len(text) > 10:
+                if text and len(text) > 10 and not _looks_like_css(text):
                     markdown = html_text_to_markdown(text, images, base_url=self.page.url)
                     return ChapterContent(markdown=markdown, source="dom", anti_crawl_status=anti_crawl_status)
 
@@ -370,6 +391,70 @@ class WeReadPageFetcher:
               ? window.wrpaHandler.getAntiCrawlStatus()
               : { hasWRPA: !!window.__WRPA__, hasCanvasHandler: false }
             """
+        )
+
+    async def detect_page_button(self) -> str | None:
+        """Detect the footer navigation button text: '下一页', '下一章', or None."""
+        return await self.page.evaluate(
+            """
+            () => {
+              const texts = ['下一页', '下一章', '下章'];
+              const nodes = Array.from(document.querySelectorAll('button'));
+              const target = nodes.find((node) =>
+                texts.some((text) => (node.innerText || node.title || '').trim() === text)
+              );
+              return target ? (target.innerText || target.title || '').trim() : null;
+            }
+            """
+        )
+
+    async def extract_full_chapter(self, *, images_dir: Path | None = None) -> ChapterContent:
+        """Extract a chapter that may span multiple reader pages.
+
+        Each page's canvas is rendered independently with its own y coordinate
+        space, and each page's ``.passage-content img.h-pic`` only contains
+        that page's rare chars. So we clear the hook before each page, extract
+        that page (text + rare chars + merge) independently, then click
+        "下一页" and repeat until "下一章" appears. Page markdowns are joined.
+        """
+        # Page 1: do NOT clear here. weread.py already cleared before
+        # goto_toc_item, and the canvas has rendered page 1 into the hook during
+        # that wait. Clearing now would wipe it with no re-render to refill
+        # (canvas doesn't repaint on the same page), leaving extract empty and
+        # triggering the DOM fallback (CSS garbage).
+        first = await self.extract_chapter_content(images_dir=images_dir)
+        parts = [first.markdown] if first.markdown else []
+
+        pages = 0
+        while True:
+            btn = await self.detect_page_button()
+            if btn != '下一页':
+                break
+            # Clear BEFORE turning the page: this wipes the previous page's
+            # lineRecords so the next page's y-local coords don't collide.
+            await self.clear_wrpa_markdown()
+            # Real Playwright click (DOM .click() is ignored by the reader's
+            # listeners); fall back to ArrowRight.
+            try:
+                await self.page.locator(
+                    'button.readerFooter_button:has-text("下一页")'
+                ).click(timeout=2000)
+            except Exception:
+                await self.page.keyboard.press("ArrowRight")
+            # Wait for the new page's canvas to render into the (now empty) hook.
+            await self.wait_for_chapter_render(timeout=10.0)
+            page_content = await self.extract_chapter_content(images_dir=images_dir)
+            if page_content.markdown:
+                parts.append(page_content.markdown)
+            pages += 1
+            if pages >= 200:  # safety valve
+                break
+
+        merged = "\n\n".join(p for p in parts if p).strip()
+        return ChapterContent(
+            markdown=merged,
+            source=first.source,
+            anti_crawl_status=first.anti_crawl_status,
         )
 
     async def go_next(self, previous_markdown: str, *, images_dir: Path | None = None) -> bool:
@@ -504,6 +589,9 @@ class WeReadPageFetcher:
         if not rare_chars:
             return []
         images_dir.mkdir(parents=True, exist_ok=True)
+        total_rare = len(rare_chars)
+        if total_rare:
+            self._emit_waiting(f"下载生僻字图片 0/{total_rare}...")
         enriched: list[dict] = []
         for index, rc in enumerate(rare_chars):
             src = rc.get("src")
@@ -523,6 +611,8 @@ class WeReadPageFetcher:
             rc = dict(rc)
             rc["local_path"] = f"../images/{name}.png"
             enriched.append(rc)
+            if total_rare:
+                self._emit_waiting(f"下载生僻字图片 {index + 1}/{total_rare}...")
         return enriched
 
 
