@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
 from .config import SUPPORTED_FORMATS, AppConfig, load_config
 from .platforms import ExportRequest, available_platforms, get_platform
+from .progress import ProgressRenderer
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,6 +89,11 @@ def run_interactive(config: AppConfig) -> ExportRequest:
 
 def execute_request(request: ExportRequest) -> int:
     platform = get_platform(request.platform)
+    # Attach a live progress renderer unless the caller already supplied one.
+    if request.on_progress is None:
+        renderer = ProgressRenderer()
+        request = replace(request, on_progress=renderer.handle)
+    print("开始爬取...")
     result = platform.export(request)
     print(result.message)
     if result.output_path is not None:

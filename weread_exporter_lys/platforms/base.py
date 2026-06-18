@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..progress import ProgressCallback
+
 
 @dataclass(frozen=True)
 class ExportRequest:
@@ -15,6 +17,7 @@ class ExportRequest:
     delay: float
     headless: bool
     auth_state_path: Path | None = None
+    on_progress: ProgressCallback | None = None
 
 
 @dataclass(frozen=True)

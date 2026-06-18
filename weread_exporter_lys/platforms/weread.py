@@ -28,7 +28,7 @@ class WeReadPlatform(BookPlatform):
         return self._validate_book_id(raw_value)
 
     def export(self, request: ExportRequest) -> ExportResult:
-        crawler_result = WeReadCrawler().crawl(request)
+        crawler_result = WeReadCrawler().crawl(request, on_progress=request.on_progress)
         message = crawler_result.message
         if crawler_result.warnings:
             message = message + "\n" + "\n".join(f"警告：{warning}" for warning in crawler_result.warnings)
