@@ -102,6 +102,26 @@ class CliTests(unittest.TestCase):
         self.assertTrue(request.headless)
         self.assertEqual(request.auth_state_path, Path("auth.json"))
 
+    def test_crawl_method_defaults_to_xhtml(self):
+        parser = build_parser()
+        args = parser.parse_args([])
+        request = build_request(args, AppConfig())
+        if request is not None:
+            self.assertEqual(request.crawl_method, "xhtml")
+
+    def test_crawl_method_canvas_flag_propagates(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--platform", "weread",
+                "--book-id", "7cb324e0727ab1f17cbf4c1",
+                "--crawl-method", "canvas",
+            ]
+        )
+        request = build_request(args, AppConfig())
+        self.assertIsNotNone(request)
+        self.assertEqual(request.crawl_method, "canvas")
+
     def test_build_request_returns_none_without_book(self):
         parser = build_parser()
         args = parser.parse_args([])

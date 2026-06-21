@@ -186,7 +186,11 @@ class WeReadCrawlerTests(unittest.TestCase):
 
         self.assertEqual(paths.book_dir, Path("cache") / "book1")
         self.assertEqual(paths.cover_path, Path("cache") / "book1" / "封面.jpg")
-        self.assertEqual(paths.content_dir, Path("cache") / "book1" / "content")
+        # Content lives under the per-method subdir (xhtml is the default),
+        # isolated from the canvas method's content.
+        self.assertEqual(paths.content_dir, Path("cache") / "book1" / "xhtml" / "content")
+        self.assertEqual(paths.images_dir, Path("cache") / "book1" / "xhtml" / "images")
+        self.assertEqual(paths.state_path, Path("cache") / "book1" / "xhtml" / "state.json")
         self.assertEqual(paths.auth_state_path, Path("auth.json"))
 
     def test_paths_defaults_auth_state_from_cache_dir(self):
@@ -204,6 +208,25 @@ class WeReadCrawlerTests(unittest.TestCase):
             paths.auth_state_path,
             Path("cache") / "auth" / "weread-storage-state.json",
         )
+
+    def test_paths_isolate_by_crawl_method(self):
+        """xhtml and canvas methods get separate content/images/state dirs."""
+        base = dict(
+            platform="weread", book_id="book1", output_format="md",
+            cache_dir=Path("cache"), output_dir=Path("output"),
+            delay=1, headless=True,
+        )
+        xhtml_paths = WeReadCrawler().paths_for(ExportRequest(crawl_method="xhtml", **base))
+        canvas_paths = WeReadCrawler().paths_for(ExportRequest(crawl_method="canvas", **base))
+        # Shared (method-independent): cover, toc, book_dir, auth.
+        self.assertEqual(xhtml_paths.book_dir, canvas_paths.book_dir)
+        self.assertEqual(xhtml_paths.cover_path, canvas_paths.cover_path)
+        self.assertEqual(xhtml_paths.toc_path, canvas_paths.toc_path)
+        # Isolated: content, images, state.
+        self.assertNotEqual(xhtml_paths.content_dir, canvas_paths.content_dir)
+        self.assertEqual(canvas_paths.content_dir, Path("cache") / "book1" / "canvas" / "content")
+        self.assertEqual(xhtml_paths.images_dir, Path("cache") / "book1" / "xhtml" / "images")
+        self.assertEqual(canvas_paths.state_path, Path("cache") / "book1" / "canvas" / "state.json")
 
 
 class WeReadPlatformCrawlerTests(unittest.TestCase):
@@ -605,6 +628,168 @@ class FetcherWaitingEventsTests(unittest.TestCase):
             result = asyncio.run(fetcher.wait_for_chapter_render(timeout=0.01))
 
         self.assertFalse(result)
+
+
+class XhtmlSourceTests(unittest.TestCase):
+    """Tests for the xhtml crawl method's decode + convert pipeline."""
+
+    # A minimal but structurally faithful chapter response: heading, 【原文】
+    # section, a paragraph with a rare-char <img.h-pic> inlined BETWEEN [9]
+    # and 虎 (the zero-offset position), a footnote sup/a, and a separate
+    # paragraph with a normal illustration <img>. Format:
+    #   <32 hex>PP<base64 of concatenated XHTML>
+    _XHTML_DOC = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<!DOCTYPE html>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml">\n'
+        '<head><title></title></head>\n<body>\n'
+        '<h2 class="secondTitle-1">第一卷 五帝本纪第一</h2>\n'
+        '<h3 class="thirdTitle-1">【原文】</h3>\n'
+        '<p>教熊罴貔貅<sup><a href="#a15" id="b15">[9]</a></sup>'
+        '<img alt="alt" class="h-pic" src="https://res.weread.qq.com/wrepub/epub_41595377_3" '
+        'data-w="85px" data-ratio="0.941" data-w-new="80px"/>'
+        '虎，以与炎帝战于阪泉<sup><a href="#a16" id="b16">[10]</a></sup>之野。</p>\n'
+        '<p><img alt="插图" src="https://res.weread.qq.com/wrco/illustration_123.jpg"/></p>\n'
+        '</body>\n</html>'
+    )
+
+    def _make_response(self, xhtml: str = _XHTML_DOC, flag: str = "P") -> str:
+        """Build a single ``e_N`` response body.
+
+        Format: ``<32-hex hash><1 flag char><base64 chunk>``. A real chapter
+        spans multiple such responses whose base64 chunks concatenate; for
+        single-response tests we encode the whole XHTML in one chunk.
+        """
+        import base64
+        b64 = base64.b64encode(xhtml.encode("utf-8")).decode("ascii")
+        return "D8E5F0E2C4530BF7951D5E3B72969590" + flag + b64
+
+    def test_decode_chapter_responses_handles_hash_flag_base64(self):
+        from weread_exporter_lys.crawler.xhtml_source import decode_chapter_responses
+        responses = {0: self._make_response()}
+        xhtml = decode_chapter_responses(responses)
+        self.assertIsNotNone(xhtml)
+        self.assertIn("熊罴貔貅", xhtml)
+        self.assertIn("h-pic", xhtml)
+
+    def test_decode_returns_none_for_empty_or_invalid(self):
+        from weread_exporter_lys.crawler.xhtml_source import decode_chapter_responses
+        self.assertIsNone(decode_chapter_responses({}))
+        self.assertIsNone(decode_chapter_responses({0: "{}"}))
+        self.assertIsNone(decode_chapter_responses({0: "notbase64!!!"}))
+
+    def test_decode_concatenates_multiple_chunks_in_index_order(self):
+        """A chapter's base64 stream is split across e_N chunks; concatenating
+        them in N order (after stripping 32-hex hash + 1 flag char) decodes
+        the full XHTML."""
+        from weread_exporter_lys.crawler.xhtml_source import decode_chapter_responses
+        import base64
+        full = '<?xml version="1.0"?><html><body><p>甲段乙段</p></body></html>'
+        b64 = base64.b64encode(full.encode("utf-8")).decode("ascii")
+        # Split the base64 into 2 chunks (not on a 4-char boundary, to mimic
+        # the real server-side chunking).
+        mid = len(b64) // 2 + 1
+        chunk_a, chunk_b = b64[:mid], b64[mid:]
+        resp_a = "00" * 16 + "P" + chunk_a
+        resp_b = "11" * 16 + "Q" + chunk_b
+        # Out-of-order dict insertion shouldn't matter — sorted by key.
+        xhtml = decode_chapter_responses({1: resp_b, 0: resp_a})
+        self.assertIsNotNone(xhtml)
+        self.assertIn("甲段乙段", xhtml)
+
+    def test_rare_char_image_inlined_at_exact_position(self):
+        """The core zero-offset guarantee: <img h-pic> stays between [9] and 虎."""
+        from weread_exporter_lys.crawler.xhtml_source import decode_chapter_responses, xhtml_to_markdown
+        # Decode the fixture response the same way the fetcher does.
+        xhtml = decode_chapter_responses({0: self._make_response()})
+        self.assertIsNotNone(xhtml)
+        markdown, rare_srcs = xhtml_to_markdown(xhtml, page_url="https://weread.qq.com/")
+        # Rare-char token must sit between [9] and 虎 — zero offset.
+        self.assertIn("[9]![](../images/wrepub_41595377_3.png)虎", markdown)
+        self.assertIn("## 第一卷 五帝本纪第一", markdown)
+        self.assertIn("### 【原文】", markdown)
+        self.assertIn("[10]", markdown)
+        # The rare-char src was inlined.
+        self.assertIn("https://res.weread.qq.com/wrepub/epub_41595377_3", rare_srcs)
+
+    def test_normal_illustration_appended_at_tail_not_inline(self):
+        from weread_exporter_lys.crawler.xhtml_source import decode_chapter_responses, xhtml_to_markdown
+        xhtml = decode_chapter_responses({0: self._make_response()})
+        markdown, _ = xhtml_to_markdown(xhtml, page_url="https://weread.qq.com/")
+        # The illustration src appears at the tail, not inline in the body paragraph.
+        self.assertIn("illustration_123.jpg", markdown)
+        # The illustration is NOT glued to the rare-char paragraph (it's a
+        # separate tail block).
+        rare_line = [ln for ln in markdown.split("\n\n") if "熊罴" in ln][0]
+        self.assertNotIn("illustration_123", rare_line)
+
+    def test_rare_char_name_uses_wr_prefix_and_src_stem(self):
+        from weread_exporter_lys.crawler.xhtml_source import rare_char_name
+        self.assertEqual(
+            rare_char_name("https://res.weread.qq.com/wrepub/epub_41595377_3"),
+            "wrepub_41595377_3",
+        )
+        self.assertEqual(rare_char_name("https://x/y/z"), "wrz")
+
+    def test_collect_rare_char_srcs_dedup_by_src(self):
+        from weread_exporter_lys.crawler.xhtml_source import collect_rare_char_srcs
+        xhtml = (
+            '<img class="h-pic" src="https://res.weread.qq.com/wrepub/epub_4"/>'
+            '<img class="h-pic" src="https://res.weread.qq.com/wrepub/epub_4"/>'
+            '<img class="h-pic" src="https://res.weread.qq.com/wrepub/epub_5"/>'
+        )
+        srcs = collect_rare_char_srcs(xhtml)
+        # Same src collapses to one entry; two distinct srcs → two entries.
+        self.assertEqual(len(srcs), 2)
+        self.assertEqual(srcs["https://res.weread.qq.com/wrepub/epub_4"], "wrepub_4")
+
+
+class FetcherXhtmlDispatchTests(unittest.TestCase):
+    """The fetcher routes to the xhtml path when crawl_method == 'xhtml' and
+    chapter responses were captured, and falls back to canvas otherwise."""
+
+    def _make_fetcher(self, crawl_method="xhtml"):
+        fetcher = WeReadPageFetcher.__new__(WeReadPageFetcher)
+        fetcher.crawl_method = crawl_method
+        fetcher.on_progress = None
+        fetcher._chapter_responses = {}
+        return fetcher
+
+    def test_drain_chapter_responses_returns_and_clears(self):
+        fetcher = self._make_fetcher()
+        fetcher._chapter_responses = {0: "body0", 1: "body1"}
+        drained = fetcher.drain_chapter_responses()
+        self.assertEqual(drained, {0: "body0", 1: "body1"})
+        self.assertEqual(fetcher._chapter_responses, {})
+
+    def test_extract_via_xhtml_returns_none_when_no_responses(self):
+        fetcher = self._make_fetcher()
+        # No responses captured → None (signals canvas fallback).
+        import asyncio
+        result = asyncio.run(fetcher._extract_via_xhtml(images_dir=None))
+        self.assertIsNone(result)
+
+    def test_extract_via_xhtml_returns_none_for_invalid_response(self):
+        """An invalid response body decodes to None → canvas fallback."""
+        fetcher = self._make_fetcher()
+        fetcher._chapter_responses = {0: "{}"}  # server-rejected unsigned request
+        import asyncio
+        result = asyncio.run(fetcher._extract_via_xhtml(images_dir=None))
+        self.assertIsNone(result)
+
+    def test_canvas_method_skips_xhtml_path(self):
+        """crawl_method == 'canvas' never touches _chapter_responses."""
+        # We can't easily run extract_chapter_content without a browser, but
+        # we can assert the guard: the xhtml branch is only entered when
+        # crawl_method == 'xhtml'. For canvas, drain_chapter_responses is
+        # never called, so responses accumulate (and would be stale). This
+        # test documents that contract.
+        fetcher = self._make_fetcher("canvas")
+        fetcher._chapter_responses = {0: "stale"}
+        # Simulate the guard check extract_chapter_content performs.
+        self.assertNotEqual(fetcher.crawl_method, "xhtml")
+        # Canvas path leaves _chapter_responses untouched (no drain).
+        self.assertEqual(fetcher._chapter_responses, {0: "stale"})
 
 
 if __name__ == "__main__":
