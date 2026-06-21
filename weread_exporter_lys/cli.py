@@ -5,7 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
-from .config import SUPPORTED_FORMATS, AppConfig, load_config
+from .config import SUPPORTED_CRAWL_METHODS, SUPPORTED_FORMATS, AppConfig, load_config
 from .platforms import ExportRequest, available_platforms, get_platform
 from .progress import ProgressRenderer
 
@@ -28,6 +28,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, help="JSON 配置文件路径")
     parser.add_argument("--auth-state", type=Path, help="微信读书登录态 storage_state 文件路径")
     parser.add_argument("--headless", action="store_true", help="后续爬虫层使用无头浏览器")
+    parser.add_argument(
+        "--crawl-method",
+        choices=SUPPORTED_CRAWL_METHODS,
+        default="xhtml",
+        help="爬取方法：xhtml（默认，结构化源直取，生僻字零误差）或 canvas（旧法，坐标合并）",
+    )
+    parser.add_argument(
+        "--max-chapters", type=int, default=0,
+        help="最多爬取章节数（0=全部）",
+    )
     parser.add_argument("--interactive", action="store_true", help="强制进入交互式向导")
     return parser
 
@@ -40,6 +50,8 @@ def build_request(args: argparse.Namespace, config: AppConfig) -> ExportRequest 
     delay = args.delay if args.delay is not None else config.delay
     headless = args.headless or config.headless
     auth_state_path = args.auth_state or config.auth_state_path
+    crawl_method = args.crawl_method or config.crawl_method
+    max_chapters = args.max_chapters if args.max_chapters is not None else 0
 
     raw_book = args.url or args.book_id
     if raw_book is None:
@@ -57,6 +69,8 @@ def build_request(args: argparse.Namespace, config: AppConfig) -> ExportRequest 
         delay=delay,
         headless=headless,
         auth_state_path=auth_state_path,
+        crawl_method=crawl_method,
+        max_chapters=max_chapters,
     )
 
 
@@ -72,6 +86,8 @@ def run_interactive(config: AppConfig) -> ExportRequest:
     raw_book = _prompt_required("请输入书本链接或书本 id: ")
     book_id = platform.normalize_book_id(raw_book)
     output_format = _choose_format(config.default_format)
+    crawl_method = _choose_crawl_method(config.crawl_method)
+    max_chapters = _prompt_int("最多爬取章数（0=全部，回车默认全部）", 0)
 
     request = ExportRequest(
         platform=platform.name,
@@ -82,6 +98,8 @@ def run_interactive(config: AppConfig) -> ExportRequest:
         delay=config.delay,
         headless=config.headless,
         auth_state_path=config.auth_state_path,
+        crawl_method=crawl_method,
+        max_chapters=max_chapters,
     )
     print_request_summary(request)
     return request
@@ -89,7 +107,6 @@ def run_interactive(config: AppConfig) -> ExportRequest:
 
 def execute_request(request: ExportRequest) -> int:
     platform = get_platform(request.platform)
-    # Attach a live progress renderer unless the caller already supplied one.
     if request.on_progress is None:
         renderer = ProgressRenderer()
         request = replace(request, on_progress=renderer.handle)
@@ -112,6 +129,8 @@ def print_request_summary(request: ExportRequest) -> None:
     print(f"  输出目录：{request.output_dir}")
     print(f"  停顿秒数：{request.delay}")
     print(f"  无头模式：{'是' if request.headless else '否'}")
+    print(f"  爬取方法：{request.crawl_method}")
+    print(f"  最多章数：{'全部' if not request.max_chapters else request.max_chapters}")
     print(f"  登录态文件：{request.auth_state_path or request.cache_dir / 'auth' / 'weread-storage-state.json'}")
     print()
 
@@ -128,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             delay=args.delay,
             headless=True if args.headless else None,
             auth_state_path=args.auth_state,
+            crawl_method=args.crawl_method,
         )
 
         request = None if args.interactive else build_request(args, config)
@@ -146,12 +166,10 @@ def _choose_platform(platforms, default_name: str):
         (index for index, platform in enumerate(platforms, start=1) if platform.name == default_name),
         1,
     )
-
     print("请选择阅读平台：")
     for index, platform in enumerate(platforms, start=1):
         default_mark = "（默认）" if index == default_index else ""
         print(f"  {index}. {platform.display_name} ({platform.name}){default_mark}")
-
     while True:
         raw_choice = input(f"请输入序号 [{default_index}]: ").strip()
         if not raw_choice:
@@ -168,7 +186,6 @@ def _choose_format(default_format: str) -> str:
     for index, output_format in enumerate(SUPPORTED_FORMATS, start=1):
         default_mark = "（默认）" if output_format == default_format else ""
         print(f"  {index}. {output_format}{default_mark}")
-
     default_index = SUPPORTED_FORMATS.index(default_format) + 1
     while True:
         raw_choice = input(f"请输入序号 [{default_index}]: ").strip()
@@ -183,9 +200,43 @@ def _choose_format(default_format: str) -> str:
         print("请输入有效的目标格式。")
 
 
+def _choose_crawl_method(default_method: str) -> str:
+    descriptions = {
+        "xhtml": "结构化源直取，生僻字零误差（推荐）",
+        "canvas": "旧法，canvas 坐标合并",
+    }
+    print("请选择爬取方法：")
+    for index, method in enumerate(SUPPORTED_CRAWL_METHODS, start=1):
+        default_mark = "（默认）" if method == default_method else ""
+        desc = descriptions.get(method, "")
+        print(f"  {index}. {method} — {desc}{default_mark}")
+    default_index = SUPPORTED_CRAWL_METHODS.index(default_method) + 1
+    while True:
+        raw_choice = input(f"请输入序号 [{default_index}]: ").strip()
+        if not raw_choice:
+            return default_method
+        if raw_choice.isdigit():
+            index = int(raw_choice)
+            if 1 <= index <= len(SUPPORTED_CRAWL_METHODS):
+                return SUPPORTED_CRAWL_METHODS[index - 1]
+        if raw_choice in SUPPORTED_CRAWL_METHODS:
+            return raw_choice
+        print("请输入有效的爬取方法序号。")
+
+
 def _prompt_required(prompt: str) -> str:
     while True:
         value = input(prompt).strip()
         if value:
             return value
         print("输入不能为空。")
+
+
+def _prompt_int(prompt: str, default: int = 0) -> int:
+    while True:
+        value = input(f"{prompt}: ").strip()
+        if not value:
+            return default
+        if value.isdigit():
+            return int(value)
+        print("请输入有效数字。")

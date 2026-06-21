@@ -18,6 +18,9 @@ class ExportRequest:
     headless: bool
     auth_state_path: Path | None = None
     on_progress: ProgressCallback | None = None
+    crawl_method: str = "xhtml"
+    # Limit the number of chapters to crawl (0 = crawl all).
+    max_chapters: int = 0
 
 
 @dataclass(frozen=True)

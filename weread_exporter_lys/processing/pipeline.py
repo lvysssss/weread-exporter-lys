@@ -43,8 +43,18 @@ class ProcessingPipeline:
         return self.request.cache_dir / self.request.book_id
 
     @property
+    def method_dir(self) -> Path:
+        """Per-crawl-method subdirectory (``xhtml/`` or ``canvas/``).
+
+        Content, images, state and the processed markdown live here so the two
+        crawl methods don't pollute each other's output. Cover/toc/meta on
+        ``book_dir`` itself remain shared.
+        """
+        return self.book_dir / self.request.crawl_method
+
+    @property
     def content_dir(self) -> Path:
-        return self.book_dir / "content"
+        return self.method_dir / "content"
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -87,7 +97,7 @@ class ProcessingPipeline:
         md = add_footnote_links(md)
 
         # ---- 6. Save the processed Markdown ----
-        md_path = self.book_dir / f"{title}.md"
+        md_path = self.method_dir / f"{title}.md"
         md_path.write_text(md, encoding="utf-8")
         emit(on_progress, ProgressEvent(
             kind="processing_step",
@@ -102,7 +112,7 @@ class ProcessingPipeline:
         output_path = convert_markdown(
             md_path,
             fmt,
-            book_dir=self.book_dir,
+            book_dir=self.method_dir,
             title=title,
             author=author,
         )

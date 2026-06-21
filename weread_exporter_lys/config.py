@@ -7,6 +7,7 @@ from typing import Any
 
 DEFAULT_CONFIG_PATH = Path(".weread-exporter-lys.json")
 SUPPORTED_FORMATS = ("md", "txt", "pdf", "epub", "mobi", "azw3")
+SUPPORTED_CRAWL_METHODS = ("xhtml", "canvas")
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class AppConfig:
     delay: float = 1.0
     headless: bool = False
     auth_state_path: Path | None = None
+    crawl_method: str = "xhtml"
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "AppConfig":
@@ -45,6 +47,10 @@ class AppConfig:
             formats = ", ".join(SUPPORTED_FORMATS)
             raise ValueError(f"Unsupported default format: {self.default_format}. Use one of: {formats}")
 
+        if self.crawl_method not in SUPPORTED_CRAWL_METHODS:
+            methods = ", ".join(SUPPORTED_CRAWL_METHODS)
+            raise ValueError(f"Unsupported crawl method: {self.crawl_method}. Use one of: {methods}")
+
         if self.delay < 0:
             raise ValueError("Delay must be greater than or equal to 0")
 
@@ -60,6 +66,7 @@ class AppConfig:
         delay: float | None = None,
         headless: bool | None = None,
         auth_state_path: Path | None = None,
+        crawl_method: str | None = None,
     ) -> "AppConfig":
         updates: dict[str, Any] = {}
         if default_platform is not None:
@@ -76,6 +83,8 @@ class AppConfig:
             updates["headless"] = headless
         if auth_state_path is not None:
             updates["auth_state_path"] = auth_state_path
+        if crawl_method is not None:
+            updates["crawl_method"] = crawl_method
 
         return replace(self, **updates).validate()
 

@@ -39,7 +39,6 @@ class WeReadCrawler:
 
     @staticmethod
     def _max_saved_chapter(content_dir: Path) -> int:
-        """Return the highest chapter number saved on disk, or 0 if none."""
         if not content_dir.is_dir():
             return 0
         max_n = 0
@@ -55,14 +54,15 @@ class WeReadCrawler:
 
     def paths_for(self, request: ExportRequest) -> WeReadCrawlerPaths:
         book_dir = request.cache_dir / request.book_id
+        method_dir = book_dir / request.crawl_method
         auth_state_path = request.auth_state_path or request.cache_dir / "auth" / "weread-storage-state.json"
         return WeReadCrawlerPaths(
             book_dir=book_dir,
             cover_path=book_dir / "封面.jpg",
             toc_path=book_dir / "toc.json",
-            state_path=book_dir / "state.json",
-            content_dir=book_dir / "content",
-            images_dir=book_dir / "images",
+            state_path=method_dir / "state.json",
+            content_dir=method_dir / "content",
+            images_dir=method_dir / "images",
             auth_state_path=auth_state_path,
         )
 
@@ -74,10 +74,6 @@ class WeReadCrawler:
         state = CrawlState.load(paths.state_path, book_id=request.book_id, reader_url=reader_url)
 
         def warn(message: str) -> None:
-            # Only surface a warning once per crawl — repeated identical
-            # messages (e.g. "检测到 WRPA" on every chapter) just clutter the
-            # progress line. CrawlState.add_warning already de-dups state, so
-            # we gate the event on the same check.
             if message in state.warnings:
                 return
             state.add_warning(message)
@@ -89,6 +85,7 @@ class WeReadCrawler:
                 delay=request.delay,
                 auth_state_path=paths.auth_state_path,
                 on_progress=on_progress,
+                crawl_method=request.crawl_method,
             ) as fetcher:
                 await fetcher.goto_reader(request.book_id)
                 await fetcher.ensure_logged_in()
@@ -119,11 +116,9 @@ class WeReadCrawler:
                     emit(on_progress, ProgressEvent(kind="toc", total=1))
 
                 total = len(toc) if toc else 1
+                if request.max_chapters and request.max_chapters < total:
+                    total = request.max_chapters
                 emit(on_progress, ProgressEvent(kind="started", total=total))
-                # Resume from the highest saved chapter file on disk, not from
-                # state.json.  This lets users delete/reorder chapter files to
-                # control where the crawl picks up — e.g. deleting 50.md–100.md
-                # will cause those chapters to be re-fetched.
                 current_index = self._max_saved_chapter(paths.content_dir)
 
                 while current_index < total:
