@@ -116,6 +116,18 @@ class WeReadCrawler:
                     warn("未能从页面提取目录，将只保存当前可见正文。")
                     emit(on_progress, ProgressEvent(kind="toc", total=1))
 
+                # Extract book metadata (title / author / description) from page
+                # meta tags. Saved as meta.json in the shared book_dir so both
+                # crawl methods and the processing pipeline can read it.
+                meta_path = paths.book_dir / "meta.json"
+                if not meta_path.exists():
+                    try:
+                        meta = await fetcher.extract_book_meta()
+                        if meta and (meta.get("title") or meta.get("author")):
+                            write_json(meta_path, meta)
+                    except Exception:
+                        pass
+
                 total = len(toc) if toc else 1
                 if request.max_chapters and request.max_chapters < total:
                     total = request.max_chapters

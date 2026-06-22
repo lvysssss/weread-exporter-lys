@@ -229,6 +229,51 @@ class WeReadPageFetcher:
         target.write_bytes(await response.body())
         return True
 
+    async def extract_book_meta(self) -> dict[str, str]:
+        """Extract book metadata from the WeRead book/info API.
+
+        Discovers the numeric ``bookId`` from the cover image URL (which is
+        always present on the reader page), then fetches full metadata via
+        ``/web/book/info``.
+        """
+        import json
+
+        # 1. Find numeric bookId — embedded in the og:image cover URL path.
+        cover_url = await self.page.evaluate(
+            """
+            () => {
+              const meta = document.querySelector('meta[property="og:image"]');
+              return meta ? (meta.content || '') : '';
+            }
+            """
+        )
+        m = re.search(r"/cover/\d+/(\d+)/", cover_url) if cover_url else None
+        numeric_id = m.group(1) if m else ""
+        if not numeric_id:
+            return {}
+
+        # 2. Fetch full metadata.
+        try:
+            resp = await self.page.request.get(
+                f"https://weread.qq.com/web/book/info?bookId={numeric_id}",
+                headers={"accept": "application/json"},
+            )
+            if not resp.ok:
+                return {}
+            data = json.loads(await resp.text())
+        except Exception:
+            return {}
+
+        meta: dict[str, str] = {}
+        for key in ("title", "author", "intro", "publisher", "publishTime", "isbn"):
+            val = str(data.get(key, "")).strip()
+            if val:
+                meta[key] = val
+        copyright_info = data.get("copyrightInfo")
+        if isinstance(copyright_info, dict) and copyright_info.get("name"):
+            meta["copyright"] = str(copyright_info["name"]).strip()
+        return meta
+
     async def extract_toc(self) -> list[dict[str, Any]]:
         try:
             await self.page.wait_for_selector(".readerControls", timeout=10000)
