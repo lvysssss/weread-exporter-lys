@@ -168,32 +168,19 @@ class ProcessingPipeline:
 
         return results, all_warnings
 
-    # Volume-suffix pattern: "（第一册）", "(第一卷)", etc.
-    _VOLUME_SUFFIX = re.compile(r"[（(]第[^)）]*[册卷][)）]")
-
     def _derive_title(self, toc: list[dict]) -> str:
-        """Derive the book title, preferring crawler metadata."""
-        title = ""
-
-        # 1. Try crawler metadata.
+        """Return the book title from meta.json, falling back to the first TOC entry."""
         meta_path = self.book_dir / "meta.json"
         if meta_path.exists():
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 if isinstance(meta, dict) and meta.get("title"):
-                    title = str(meta["title"]).strip()
+                    return str(meta["title"]).strip()
             except (json.JSONDecodeError, OSError):
                 pass
-
-        # 2. Fall back to the first TOC entry.
-        if not title and toc:
-            title = toc[0].get("title", "").strip()
-
-        # 3. Strip volume suffixes so "史记（第一册）" becomes "史记".
-        if title:
-            title = self._VOLUME_SUFFIX.sub("", title).strip()
-
-        return title or "导出书籍"
+        if toc:
+            return toc[0].get("title", "").strip()
+        return "导出书籍"
 
     def _derive_author(self) -> str:
         """Derive the book author from crawler metadata."""
