@@ -414,7 +414,7 @@ class WeReadPageFetcher:
 
             if not wrpa_markdown or len(wrpa_markdown) < 30:
                 text = await self._first_text(BODY_SELECTORS)
-                if text and len(text) > 10 and not _looks_like_css(text):
+                if text and len(text) > 100 and not _looks_like_css(text):
                     markdown = html_text_to_markdown(text, images, base_url=self.page.url)
                     return ChapterContent(markdown=markdown, source="dom", anti_crawl_status=anti_crawl_status)
 
