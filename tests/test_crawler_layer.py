@@ -679,23 +679,39 @@ class XhtmlSourceTests(unittest.TestCase):
         self.assertIsNone(decode_chapter_responses({0: "notbase64!!!"}))
 
     def test_decode_concatenates_multiple_chunks_in_index_order(self):
-        """A chapter's base64 stream is split across e_N chunks; concatenating
-        them in N order (after stripping 32-hex hash + 1 flag char) decodes
-        the full XHTML."""
+        """Each e_N response is a self-contained base64 block with flag 'P'.
+        Only P-flag chunks are decoded; their decoded text is concatenated
+        in N order. Non-P (encrypted) chunks are skipped."""
         from weread_exporter_lys.crawler.xhtml_source import decode_chapter_responses
         import base64
-        full = '<?xml version="1.0"?><html><body><p>甲段乙段</p></body></html>'
-        b64 = base64.b64encode(full.encode("utf-8")).decode("ascii")
-        # Split the base64 into 2 chunks (not on a 4-char boundary, to mimic
-        # the real server-side chunking).
-        mid = len(b64) // 2 + 1
-        chunk_a, chunk_b = b64[:mid], b64[mid:]
-        resp_a = "00" * 16 + "P" + chunk_a
-        resp_b = "11" * 16 + "Q" + chunk_b
+        doc_a = '<?xml version="1.0"?><html><body><p>甲段</p></body></html>'
+        doc_b = '<?xml version="1.0"?><html><body><p>乙段</p></body></html>'
+        b64_a = base64.b64encode(doc_a.encode("utf-8")).decode("ascii")
+        b64_b = base64.b64encode(doc_b.encode("utf-8")).decode("ascii")
+        resp_a = "00" * 16 + "P" + b64_a
+        resp_b = "11" * 16 + "P" + b64_b
         # Out-of-order dict insertion shouldn't matter — sorted by key.
         xhtml = decode_chapter_responses({1: resp_b, 0: resp_a})
         self.assertIsNotNone(xhtml)
-        self.assertIn("甲段乙段", xhtml)
+        self.assertIn("甲段", xhtml)
+        self.assertIn("乙段", xhtml)
+
+    def test_decode_skips_encrypted_non_p_chunks(self):
+        """Non-P flag chunks are encrypted and must be skipped to avoid
+        corrupting the output with binary garbage."""
+        from weread_exporter_lys.crawler.xhtml_source import decode_chapter_responses
+        import base64
+        doc = '<?xml version="1.0"?><html><body><p>明文</p></body></html>'
+        b64 = base64.b64encode(doc.encode("utf-8")).decode("ascii")
+        # e_0: plaintext (flag P), e_1: encrypted (flag u), e_2: plaintext (flag P)
+        resp_0 = "00" * 16 + "P" + b64
+        resp_1 = "11" * 16 + "u" + b64  # would be garbage if decoded
+        resp_2 = "22" * 16 + "P" + b64
+        xhtml = decode_chapter_responses({0: resp_0, 1: resp_1, 2: resp_2})
+        self.assertIsNotNone(xhtml)
+        self.assertIn("明文", xhtml)
+        # The encrypted chunk should not contribute any garbage.
+        self.assertNotIn("\ufffd", xhtml)
 
     def test_rare_char_image_inlined_at_exact_position(self):
         """The core zero-offset guarantee: <img h-pic> stays between [9] and 虎."""

@@ -4,13 +4,18 @@ When the WeRead reader loads a chapter, the browser fires a batch of
 ``POST /web/book/chapter/e_{N}`` requests (signed with a one-shot
 ``x-wrpa-0`` header). Each response body is::
 
-    <32-hex-hash>PP<base64 of one or more XHTML documents concatenated>
+    <32-hex-hash><1 flag char><base64 chunk>
 
-Decoded, the XHTML is the chapter's original EPUB source with rare
-characters inlined as ``<img class="h-pic">`` at their exact text-stream
-position and footnotes as ``<sup><a href id>[n]</a></sup>`` bidirectional
-anchors. Capturing these responses (via Playwright's ``page.on("response")``)
-lets us bypass canvas coordinate merging entirely, yielding zero-offset
+The flag char indicates the chunk type: ``P`` = plaintext base64 (decodes
+to UTF-8 XHTML/CSS), other flags = encrypted binary (cannot be decoded
+without ``window.__WRPA__.decode()``). Only P-flag chunks are decoded;
+encrypted chunks are skipped to avoid corrupting the output.
+
+Decoded XHTML is the chapter's original EPUB source with rare characters
+inlined as ``<img class="h-pic">`` at their exact text-stream position and
+footnotes as ``<sup><a href id>[n]</a></sup>`` bidirectional anchors.
+Capturing these responses (via Playwright's ``page.on("response")``) lets
+us bypass canvas coordinate merging entirely, yielding zero-offset
 rare-character placement.
 
 This module is purely functional and has no Playwright dependency — the
@@ -38,23 +43,27 @@ _HPIC_RE = re.compile(
 )
 
 # Each ``e_{N}`` response body is ``<32-hex hash><1 flag char><base64 chunk>``.
-# A chapter is fetched as a contiguous range of such chunks (e.g. e_0..e_3);
-# the base64 chunks concatenate (in N order) into one stream that decodes to
-# the chapter's full XHTML (multiple ``<?xml`` documents joined). The flag
-# char (e.g. ``P``, ``E``, ``j``) is per-chunk metadata, not base64 payload.
+# The flag char indicates the chunk type:
+#   ``P`` = plaintext base64 (decodes to UTF-8 XHTML/CSS)
+#   other = encrypted binary (cannot be decoded without ``__WRPA__.decode()``)
+# Each P-flag chunk is a self-contained base64 block (may include ``=``
+# padding). Concatenating all chunks and decoding as one stream corrupts
+# the output because: (1) ``=`` padding mid-stream breaks alignment, and
+# (2) encrypted chunks produce binary garbage that pollutes the text.
+# Fix: decode each chunk independently, only include P-flag chunks.
 _HASH_LEN = 32
 _FLAG_LEN = 1
+_PLAINTEXT_FLAG = "P"
 
 
 def decode_chapter_responses(responses: dict[int, str]) -> str | None:
     """Decode and concatenate captured ``e_{N}`` chapter responses.
 
     ``responses`` maps the batch index ``N`` (from the URL ``e_{N}``) to the
-    raw response body. The reader fetches a chapter as a contiguous range of
-    batch indices; each body is ``<32-hex hash><1 flag char><base64 chunk>``
-    and the base64 chunks concatenate (in ascending ``N`` order) into one
-    stream that decodes to the chapter's full XHTML — multiple ``<?xml``
-    documents (one per 【原文】/【注释】 section) joined end-to-end.
+    raw response body. Each body is ``<32-hex hash><1 flag char><base64>``.
+    Only chunks with flag ``P`` (plaintext) are decoded; encrypted chunks
+    (other flags) are skipped to avoid corrupting the output with binary
+    garbage.
 
     Returns the decoded XHTML text, or ``None`` if no body yielded decodable
     content.
@@ -62,23 +71,29 @@ def decode_chapter_responses(responses: dict[int, str]) -> str | None:
     if not responses:
         return None
 
-    # Concatenate the base64 chunks in batch-index order, stripping each
-    # body's 32-hex hash prefix and 1-char flag prefix.
-    b64_stream = "".join(
-        responses[n][_HASH_LEN + _FLAG_LEN:]
-        for n in sorted(responses)
-        if responses[n]
-    )
-    if not b64_stream:
-        return None
+    parts: list[str] = []
+    for n in sorted(responses):
+        body = responses[n]
+        if not body or len(body) <= _HASH_LEN + _FLAG_LEN:
+            continue
+        flag = body[_HASH_LEN]
+        if flag != _PLAINTEXT_FLAG:
+            continue
+        b64_chunk = body[_HASH_LEN + _FLAG_LEN:]
+        if not b64_chunk:
+            continue
+        # Each chunk is a self-contained base64 block; ensure proper padding.
+        padded = b64_chunk + "=" * (-len(b64_chunk) % 4)
+        try:
+            decoded = base64.b64decode(padded, validate=False).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        if decoded:
+            parts.append(decoded)
 
-    # Restore base64 padding before decoding.
-    padded = b64_stream + "=" * (-len(b64_stream) % 4)
-    try:
-        decoded = base64.b64decode(padded, validate=False).decode("utf-8", errors="replace")
-    except Exception:
+    if not parts:
         return None
-    return decoded if decoded else None
+    return "".join(parts)
 
 
 def rare_char_name(src: str) -> str:
