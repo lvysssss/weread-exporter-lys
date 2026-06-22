@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .images import ImageFilter
 
@@ -18,11 +18,14 @@ IMAGE_SELECTORS = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass
 class ChapterContent:
     markdown: str
     source: str
     anti_crawl_status: dict | None = None
+    # Raw decoded XHTML source (from the e_N response capture), so the
+    # crawler can persist it to disk for resume and cache-hit detection.
+    xhtml_source: str | None = None
 
 
 def normalize_markdown_text(text: str) -> str:
@@ -58,28 +61,9 @@ def merge_rare_chars(
     *,
     line_tolerance: float = 20.0,
 ) -> str:
-    """Interleave rare-character image tokens into canvas text lines by coordinate.
-
-    ``lines`` is the output of ``wrpaHandler.getLinesWithCoords()``: each record
-    has ``{text, fragments, y, fontSize, minFontSize, prefix}``. ``fragments`` is
-    a list of ``{text, xCss}`` (canvas-CSS space, sorted by x) — the per-glyph
-    pieces the canvas drew, with gaps where rare chars sit. ``y`` is the line's
-    top y in canvas-CSS space. ``rare_chars`` is a list of
-    ``{local_path, x, y, ...}`` where ``x``/``y`` are the rare-char <img>
-    translate coords converted to the same canvas-CSS space.
-
-    Each rare char is matched to the closest line by y, then inserted *inside*
-    that line at the x gap where the canvas left a blank: the token goes just
-    before the first fragment whose ``xCss`` exceeds the image's ``x``. If no
-    fragment is to the right (image at line end) the token is appended. This
-    fixes cases like ``[3]：搅乱。`` where the image belongs between ``[3]`` and
-    ``：`` rather than at line end. Rare chars with no close line (beyond
-    ``line_tolerance``) are appended at the end in y order so nothing is lost.
-    """
     if not lines:
         return ""
 
-    # Build mutable copies of rows; prefer fragment-level geometry when present.
     rows: list[dict] = []
     for rec in lines:
         fragments = rec.get("fragments")
@@ -89,8 +73,6 @@ def merge_rare_chars(
                 for f in fragments
             ]
         else:
-            # Backward-compat: synthesize a single fragment from the joined text
-            # so the image falls back to line-end insertion.
             frags = [{"text": str(rec.get("text", "")), "xCss": 0.0}] if rec.get("text") else []
         rows.append({
             "fragments": frags,
@@ -98,7 +80,6 @@ def merge_rare_chars(
             "prefix": str(rec.get("prefix", "")),
         })
 
-    # Assign each rare char to its closest row by y.
     by_row: dict[int, list[dict]] = {}
     orphans: list[tuple[float, float, str]] = []
     for rc in rare_chars:
@@ -119,13 +100,11 @@ def merge_rare_chars(
             continue
         by_row.setdefault(best_idx, []).append({"x": rc_x, "token": f"![]({local_path})"})
 
-    # Insert each assigned image into its row at the correct x gap.
     for idx, items in by_row.items():
         items.sort(key=lambda it: it["x"])
         frags = rows[idx]["fragments"]
         for item in items:
             token, rc_x = item["token"], item["x"]
-            # Find the first fragment whose xCss is >= the image x; insert before it.
             insert_at = len(frags)
             for i, fr in enumerate(frags):
                 if fr["xCss"] >= rc_x:
@@ -140,7 +119,6 @@ def merge_rare_chars(
         body = "".join(fr["text"] for fr in row["fragments"])
         if body.strip():
             parts.append(f'{row["prefix"]}{body}')
-    # Orphan rare chars (no nearby line) go at the end in y order.
     for _, _, token in sorted(orphans, key=lambda t: (t[0], t[1])):
         parts.append(token)
     return "\n\n".join(parts).strip()

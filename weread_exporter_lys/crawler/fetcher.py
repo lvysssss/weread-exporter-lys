@@ -109,13 +109,6 @@ class WeReadPageFetcher:
         emit(self.on_progress, ProgressEvent(kind="waiting", message=message))
 
     async def _wait_for_chapter_responses(self, timeout: float = 2.0) -> None:
-        """Wait up to ``timeout`` seconds for chapter/e_N responses to arrive.
-
-        Chapters that fire these requests typically complete within 1-2s of
-        ``goto_toc_item``; chapters that never fire them (导言/封面) are
-        detected when the wait expires with ``_chapter_responses`` still
-        empty.
-        """
         deadline = asyncio.get_event_loop().time() + timeout
         while (
             not self._chapter_responses
@@ -354,17 +347,25 @@ class WeReadPageFetcher:
                 self._emit_waiting(f"下载生僻字图片 {index + 1}/{total}...")
         return ChapterContent(
             markdown=markdown, source="xhtml", anti_crawl_status=anti_crawl_status or {},
+            xhtml_source=xhtml,
         )
 
-    async def extract_chapter_content(self, *, images_dir: Path | None = None) -> ChapterContent:
+    async def extract_chapter_content(self, *, images_dir: Path | None = None, chapter_index: int | None = None) -> ChapterContent:
         anti_crawl_status = await self.detect_anti_crawl()
         has_wrpa = anti_crawl_status.get("hasWRPA") or anti_crawl_status.get("hasCanvasContent")
 
+        # ── Cache hit: saved XHTML source already on disk ──────────────
+        # When resuming a previous crawl the raw XHTML was persisted; parse
+        # it directly instead of re-navigating / re-capturing.
+        if chapter_index is not None and self.crawl_method == "xhtml":
+            src_path = self._xhtml_src_path(images_dir, chapter_index)
+            if src_path is not None and src_path.exists():
+                xhtml = src_path.read_text(encoding="utf-8")
+                markdown, _ = xhtml_to_markdown(xhtml, page_url=self.page.url)
+                if markdown:
+                    return ChapterContent(markdown=markdown, source="xhtml", anti_crawl_status=anti_crawl_status)
+
         if has_wrpa:
-            # 1. XHTML method — wait briefly for e_N responses to arrive.
-            #    Chapters that fire chapter/e_N requests complete within 1-2s
-            #    of goto_toc_item; 导言/封面 chapters never fire any and the
-            #    wait expires with _chapter_responses still empty.
             if self.crawl_method == "xhtml":
                 await self._wait_for_chapter_responses(timeout=2.0)
                 if self._chapter_responses:
@@ -380,7 +381,7 @@ class WeReadPageFetcher:
                             message=f"XHTML 源解析失败，回退 canvas 路径：{error}",
                         ))
 
-            # 2. Canvas coordinate-merge (legacy path, also used by crawl_method="canvas")
+            # 2. Canvas coordinate-merge (legacy)
             wrpa_markdown = await self.page.evaluate(
                 "() => window.wrpaHandler ? window.wrpaHandler.getMarkdown() : ''"
             )
@@ -433,6 +434,16 @@ class WeReadPageFetcher:
             return ChapterContent(markdown=wrpa_markdown, source="wrpa", anti_crawl_status=anti_crawl_status)
         return ChapterContent(markdown=markdown, source="dom", anti_crawl_status=anti_crawl_status)
 
+    def _xhtml_src_path(self, images_dir: Path | None, chapter_index: int) -> Path | None:
+        """Path to a persisted raw XHTML source file for *chapter_index*.
+
+        Stored under ``{method_dir}/xhtml_src/{N}.xhtml`` so resume runs can
+        detect cache hits and skip re-capture.
+        """
+        if images_dir is None:
+            return None
+        return images_dir.parent / "xhtml_src" / f"{chapter_index}.xhtml"
+
     async def detect_anti_crawl(self) -> dict[str, Any]:
         return await self.page.evaluate(
             """
@@ -456,8 +467,8 @@ class WeReadPageFetcher:
             """
         )
 
-    async def extract_full_chapter(self, *, images_dir: Path | None = None) -> ChapterContent:
-        first = await self.extract_chapter_content(images_dir=images_dir)
+    async def extract_full_chapter(self, *, images_dir: Path | None = None, chapter_index: int | None = None) -> ChapterContent:
+        first = await self.extract_chapter_content(images_dir=images_dir, chapter_index=chapter_index)
         if first.source == "xhtml":
             return first
         parts = [first.markdown] if first.markdown else []

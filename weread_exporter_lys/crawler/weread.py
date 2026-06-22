@@ -122,10 +122,11 @@ class WeReadCrawler:
                 current_index = self._max_saved_chapter(paths.content_dir)
 
                 while current_index < total:
+                    chapter_number = current_index + 1  # 1-based chapter number for filenames
                     chapter_title = toc[current_index].get("title") if toc else None
                     emit(on_progress, ProgressEvent(
                         kind="chapter_started",
-                        index=current_index + 1,
+                        index=chapter_number,
                         total=total,
                         title=chapter_title,
                     ))
@@ -136,23 +137,36 @@ class WeReadCrawler:
                             toc = await fetcher.extract_toc()
                             await fetcher.clear_wrpa_markdown()
                             if not await fetcher.goto_toc_item(current_index):
-                                state.last_error = f"未能点击目录第 {current_index + 1} 项。"
+                                state.last_error = f"未能点击目录第 {chapter_number} 项。"
                                 state.save(paths.state_path)
                                 return self._finish(False, state.last_error, paths, state, on_progress)
 
-                    content = await fetcher.extract_full_chapter(images_dir=paths.images_dir)
+                    content = await fetcher.extract_full_chapter(
+                        images_dir=paths.images_dir, chapter_index=chapter_number,
+                    )
                     if not content.markdown:
                         state.last_error = "未能提取正文内容；可能需要登录、页面结构变化，或 WRPA hook 尚未捕获到文本。"
                         state.save(paths.state_path)
                         return self._finish(False, state.last_error, paths, state, on_progress)
 
-                    chapter_path = paths.content_dir / f"{current_index + 1}.md"
+                    # Save chapter markdown.
+                    chapter_path = paths.content_dir / f"{chapter_number}.md"
                     chapter_text = content.markdown
                     if chapter_title and not chapter_text.startswith(str(chapter_title)):
                         chapter_text = f"# {chapter_title}\n\n{chapter_text}"
                     chapter_path.write_text(chapter_text + "\n", encoding="utf-8")
+
+                    # Persist raw XHTML source so future resume runs detect a
+                    # cache hit and skip re-capture.
+                    if content.xhtml_source:
+                        xhtml_dir = paths.content_dir.parent / "xhtml_src"
+                        xhtml_dir.mkdir(parents=True, exist_ok=True)
+                        (xhtml_dir / f"{chapter_number}.xhtml").write_text(
+                            content.xhtml_source, encoding="utf-8",
+                        )
+
                     state.mark_completed(chapter_path)
-                    state.current_chapter_index = current_index + 1
+                    state.current_chapter_index = chapter_number
                     state.last_error = None
 
                     if content.anti_crawl_status and content.anti_crawl_status.get("hasWRPA"):
@@ -161,7 +175,7 @@ class WeReadCrawler:
                     state.save(paths.state_path)
                     emit(on_progress, ProgressEvent(
                         kind="chapter_saved",
-                        index=current_index + 1,
+                        index=chapter_number,
                         total=total,
                         title=chapter_title,
                     ))

@@ -400,12 +400,12 @@ class CrawlerProgressEventsTests(unittest.TestCase):
             async def goto_toc_item(self, index):
                 return True
 
-            async def extract_chapter_content(self, *, images_dir=None):
+            async def extract_chapter_content(self, *, images_dir=None, chapter_index=None):
                 from weread_exporter_lys.crawler.extractor import ChapterContent
                 return ChapterContent(markdown=f"正文{images_dir}", source="dom",
                                       anti_crawl_status={"hasWRPA": False})
 
-            async def extract_full_chapter(self, *, images_dir=None):
+            async def extract_full_chapter(self, *, images_dir=None, chapter_index=None):
                 from weread_exporter_lys.crawler.extractor import ChapterContent
                 return ChapterContent(markdown=f"正文{images_dir}", source="dom",
                                       anti_crawl_status={"hasWRPA": False})
