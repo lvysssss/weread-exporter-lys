@@ -441,8 +441,18 @@ class WeReadPageFetcher:
                         content = await self._extract_via_xhtml(
                             images_dir=images_dir, anti_crawl_status=anti_crawl_status,
                         )
-                        if content is not None:
+                        # Only accept XHTML result if it has substantial content.
+                        # When some e_N chunks are encrypted (non-P flag), the
+                        # XHTML path only decodes partial content. Fall back to
+                        # canvas to get the full chapter text.
+                        if content is not None and len(content.markdown) >= 200:
                             return content
+                        self._debug(f"extract: XHTML content too short ({len(content.markdown) if content else 0} chars), falling back to canvas")
+                    except Exception as error:
+                        emit(self.on_progress, ProgressEvent(
+                            kind="warning",
+                            message=f"XHTML 源解析失败，回退 canvas 路径：{error}",
+                        ))
                     except Exception as error:
                         emit(self.on_progress, ProgressEvent(
                             kind="warning",
