@@ -91,6 +91,7 @@ def run_interactive(config: AppConfig) -> ExportRequest:
     output_format = _choose_format(config.default_format)
     crawl_method = _choose_crawl_method(config.crawl_method)
     max_chapters = _prompt_int("最多爬取章数（0=全部，回车默认全部）", 0)
+    debug = config.debug if hasattr(config, "debug") else False
 
     request = ExportRequest(
         platform=platform.name,
