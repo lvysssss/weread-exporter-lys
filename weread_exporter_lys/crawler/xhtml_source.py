@@ -164,6 +164,18 @@ def _render_inline(node) -> str:
     return "".join(out)
 
 
+def _looks_like_css(text: str) -> bool:
+    """Detect CSS content masquerading as paragraph text.
+
+    Some chapters (e.g.导读) embed stylesheet content as <p> text in
+    the XHTML source. Detect by the density of { } ; characters.
+    """
+    if not text:
+        return False
+    css_chars = text.count("{") + text.count("}") + text.count(";")
+    return css_chars > 0 and len(text) / css_chars < 40
+
+
 def _compact_inline(text: str) -> str:
     """Collapse whitespace in inline-rendered text while preserving rare-char tokens.
 
@@ -227,19 +239,24 @@ def xhtml_to_markdown(
 
         # Paragraphs
         for p in soup.find_all("p"):
-            # Collect any non-rare images inside this paragraph for the tail.
+            # Collect non-rare images for the tail (before any CSS check).
             for img in p.find_all("img"):
                 classes = img.get("class") or []
                 src = img.get("src") or img.get("data-src") or ""
                 if "h-pic" in classes or "wrepub/" in src:
-                    continue  # rare char — left in place for _render_inline
+                    continue
                 if src:
                     tail_image_urls.append(src)
-
             inline = _render_inline(p)
             inline = _compact_inline(inline)
-            if inline.strip():
-                blocks.append(inline)
+            stripped = inline.strip()
+            if not stripped:
+                continue
+            # Skip paragraphs that are actually CSS (some 导读 chapters
+            # embed stylesheet content as <p> text).
+            if _looks_like_css(stripped):
+                continue
+            blocks.append(stripped)
 
     # Record which rare-char srcs were inlined (for tail exclusion).
     for src, _stem in collect_rare_char_srcs(xhtml).items():

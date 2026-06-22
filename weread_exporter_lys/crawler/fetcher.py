@@ -334,10 +334,21 @@ class WeReadPageFetcher:
     ) -> ChapterContent | None:
         responses = self.drain_chapter_responses()
         self._debug(f"_extract_via_xhtml: drained {len(responses)} responses")
+        if getattr(self, "debug", False) and responses:
+            import os
+            dbgdir = "cache/_debug_responses"
+            os.makedirs(dbgdir, exist_ok=True)
+            for k, v in responses.items():
+                p = os.path.join(dbgdir, f"e_{k}.txt")
+                with open(p, "w", encoding="utf-8") as fh: fh.write(v)
+                self._debug(f"  saved e_{k} ({len(v)} chars) to {p}")
         if not responses:
             return None
         xhtml = decode_chapter_responses(responses)
         self._debug(f"_extract_via_xhtml: decoded xhtml len={len(xhtml) if xhtml else 0}")
+        if getattr(self, "debug", False) and xhtml:
+            with open("cache/_debug_responses/decoded.xhtml", "w", encoding="utf-8") as fh: fh.write(xhtml)
+            self._debug("  saved decoded.xhtml")
         if not xhtml:
             return None
         markdown, rare_srcs = xhtml_to_markdown(xhtml, page_url=self.page.url)
