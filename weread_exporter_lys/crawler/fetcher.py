@@ -555,7 +555,7 @@ class WeReadPageFetcher:
               const texts = ['下一页', '下一章', '下章'];
               const nodes = Array.from(document.querySelectorAll('button'));
               const target = nodes.find((node) =>
-                texts.some((text) => (node.innerText || node.title || '').trim() === text)
+                texts.some((text) => (node.innerText || node.title || '').trim().includes(text))
               );
               return target ? (target.innerText || target.title || '').trim() : null;
             }
@@ -564,8 +564,6 @@ class WeReadPageFetcher:
 
     async def extract_full_chapter(self, *, images_dir: Path | None = None, chapter_index: int | None = None) -> ChapterContent:
         first = await self.extract_chapter_content(images_dir=images_dir, chapter_index=chapter_index)
-        if first.source == "xhtml":
-            return first
         parts = [first.markdown] if first.markdown else []
         pages = 0
         while True:
