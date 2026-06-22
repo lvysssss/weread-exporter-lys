@@ -228,35 +228,35 @@ def xhtml_to_markdown(
     for doc in _split_xhtml_docs(xhtml):
         soup = BeautifulSoup(doc, "lxml-xml")
 
-        # Headings: <h2 class="secondTitle-1"> → ## title
-        #          <h3 class="thirdTitle-1">  → ### title
-        for heading in soup.find_all(["h1", "h2", "h3", "h4"]):
-            level = int(heading.name[1])
-            text = heading.get_text(strip=True)
-            if text:
-                blocks.append(f"{'#' * level} {text}")
-            heading.decompose()
-
-        # Paragraphs
-        for p in soup.find_all("p"):
-            # Collect non-rare images for the tail (before any CSS check).
-            for img in p.find_all("img"):
-                classes = img.get("class") or []
-                src = img.get("src") or img.get("data-src") or ""
-                if "h-pic" in classes or "wrepub/" in src:
+        # Process headings and paragraphs in document order so that
+        # 【原文】 and 【注释】 headings stay interleaved with their
+        # respective paragraphs, instead of all headings bunched first.
+        for elem in soup.find_all(["h1", "h2", "h3", "h4", "p"]):
+            if elem.name in ("h1", "h2", "h3", "h4"):
+                level = int(elem.name[1])
+                text = elem.get_text(strip=True)
+                if text:
+                    blocks.append(f"{'#' * level} {text}")
+                elem.decompose()
+            elif elem.name == "p":
+                # Collect non-rare images for the tail (before any CSS check).
+                for img in elem.find_all("img"):
+                    classes = img.get("class") or []
+                    src = img.get("src") or img.get("data-src") or ""
+                    if "h-pic" in classes or "wrepub/" in src:
+                        continue
+                    if src:
+                        tail_image_urls.append(src)
+                inline = _render_inline(elem)
+                inline = _compact_inline(inline)
+                stripped = inline.strip()
+                if not stripped:
                     continue
-                if src:
-                    tail_image_urls.append(src)
-            inline = _render_inline(p)
-            inline = _compact_inline(inline)
-            stripped = inline.strip()
-            if not stripped:
-                continue
-            # Skip paragraphs that are actually CSS (some 导读 chapters
-            # embed stylesheet content as <p> text).
-            if _looks_like_css(stripped):
-                continue
-            blocks.append(stripped)
+                # Skip paragraphs that are actually CSS (some 导读 chapters
+                # embed stylesheet content as <p> text).
+                if _looks_like_css(stripped):
+                    continue
+                blocks.append(stripped)
 
     # Record which rare-char srcs were inlined (for tail exclusion).
     for src, _stem in collect_rare_char_srcs(xhtml).items():
