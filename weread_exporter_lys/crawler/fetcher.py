@@ -39,13 +39,14 @@ class LoginRequiredError(RuntimeError):
 
 
 class WeReadPageFetcher:
-    def __init__(self, *, headless: bool, delay: float, auth_state_path: Path | None = None, login_timeout: float = 180.0, on_progress: ProgressCallback | None = None, crawl_method: str = "xhtml"):
+    def __init__(self, *, headless: bool, delay: float, auth_state_path: Path | None = None, login_timeout: float = 180.0, on_progress: ProgressCallback | None = None, crawl_method: str = "xhtml", debug: bool = False):
         self.headless = headless
         self.delay = delay
         self.auth_state_path = auth_state_path
         self.login_timeout = login_timeout
         self.on_progress = on_progress
         self.crawl_method = crawl_method
+        self.debug = debug
         self._chapter_responses: dict[int, str] = {}
 
     async def __aenter__(self) -> "WeReadPageFetcher":
@@ -107,6 +108,11 @@ class WeReadPageFetcher:
 
     def _emit_waiting(self, message: str) -> None:
         emit(self.on_progress, ProgressEvent(kind="waiting", message=message))
+
+    def _debug(self, message: str) -> None:
+        if getattr(self, "debug", False):
+            import sys
+            print(f"[DEBUG] {message}", file=sys.stderr)
 
     async def _wait_for_chapter_responses(self, timeout: float = 2.0) -> None:
         deadline = asyncio.get_event_loop().time() + timeout
@@ -327,12 +333,15 @@ class WeReadPageFetcher:
         self, *, images_dir: Path | None, anti_crawl_status: dict | None = None,
     ) -> ChapterContent | None:
         responses = self.drain_chapter_responses()
+        self._debug(f"_extract_via_xhtml: drained {len(responses)} responses")
         if not responses:
             return None
         xhtml = decode_chapter_responses(responses)
+        self._debug(f"_extract_via_xhtml: decoded xhtml len={len(xhtml) if xhtml else 0}")
         if not xhtml:
             return None
         markdown, rare_srcs = xhtml_to_markdown(xhtml, page_url=self.page.url)
+        self._debug(f"_extract_via_xhtml: markdown len={len(markdown)}, rare_srcs={len(rare_srcs)}")
         if not markdown or len(markdown) < 30:
             return None
         if images_dir is not None:
@@ -353,6 +362,7 @@ class WeReadPageFetcher:
     async def extract_chapter_content(self, *, images_dir: Path | None = None, chapter_index: int | None = None) -> ChapterContent:
         anti_crawl_status = await self.detect_anti_crawl()
         has_wrpa = anti_crawl_status.get("hasWRPA") or anti_crawl_status.get("hasCanvasContent")
+        self._debug(f"extract: has_wrpa={has_wrpa}, crawl_method={self.crawl_method}, ch_responses={len(self._chapter_responses)}")
 
         # ── Cache hit: saved XHTML source already on disk ──────────────
         # When resuming a previous crawl the raw XHTML was persisted; parse
@@ -368,6 +378,7 @@ class WeReadPageFetcher:
         if has_wrpa:
             if self.crawl_method == "xhtml":
                 await self._wait_for_chapter_responses(timeout=2.0)
+                self._debug(f"extract: after wait, ch_responses={len(self._chapter_responses)}")
                 if self._chapter_responses:
                     try:
                         content = await self._extract_via_xhtml(
@@ -413,7 +424,9 @@ class WeReadPageFetcher:
                 wrpa_markdown = html_text_to_markdown(wrpa_markdown, images, base_url=self.page.url)
 
             if not wrpa_markdown or len(wrpa_markdown) < 30:
+                self._debug(f"extract: wrpa_markdown too short, trying DOM")
                 text = await self._first_text(BODY_SELECTORS)
+                self._debug(f"extract: _first_text len={len(text) if text else 0}, looks_css={_looks_like_css(text) if text else False}")
                 if text and len(text) > 100 and not _looks_like_css(text):
                     markdown = html_text_to_markdown(text, images, base_url=self.page.url)
                     return ChapterContent(markdown=markdown, source="dom", anti_crawl_status=anti_crawl_status)

@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-chapters", type=int, default=0,
         help="最多爬取章节数（0=全部）",
     )
+    parser.add_argument("--debug", action="store_true", help="调试模式，输出详细提取环节信息")
     parser.add_argument("--interactive", action="store_true", help="强制进入交互式向导")
     return parser
 
@@ -52,6 +53,7 @@ def build_request(args: argparse.Namespace, config: AppConfig) -> ExportRequest 
     auth_state_path = args.auth_state or config.auth_state_path
     crawl_method = args.crawl_method or config.crawl_method
     max_chapters = args.max_chapters if args.max_chapters is not None else 0
+    debug = args.debug if hasattr(args, "debug") else False
 
     raw_book = args.url or args.book_id
     if raw_book is None:
@@ -71,6 +73,7 @@ def build_request(args: argparse.Namespace, config: AppConfig) -> ExportRequest 
         auth_state_path=auth_state_path,
         crawl_method=crawl_method,
         max_chapters=max_chapters,
+        debug=debug,
     )
 
 
@@ -100,6 +103,7 @@ def run_interactive(config: AppConfig) -> ExportRequest:
         auth_state_path=config.auth_state_path,
         crawl_method=crawl_method,
         max_chapters=max_chapters,
+        debug=debug,
     )
     print_request_summary(request)
     return request
@@ -131,6 +135,7 @@ def print_request_summary(request: ExportRequest) -> None:
     print(f"  无头模式：{'是' if request.headless else '否'}")
     print(f"  爬取方法：{request.crawl_method}")
     print(f"  最多章数：{'全部' if not request.max_chapters else request.max_chapters}")
+    print(f'  调试模式：{"是" if request.debug else "否"}')
     print(f"  登录态文件：{request.auth_state_path or request.cache_dir / 'auth' / 'weread-storage-state.json'}")
     print()
 

@@ -86,6 +86,7 @@ class WeReadCrawler:
                 auth_state_path=paths.auth_state_path,
                 on_progress=on_progress,
                 crawl_method=request.crawl_method,
+                debug=request.debug,
             ) as fetcher:
                 await fetcher.goto_reader(request.book_id)
                 await fetcher.ensure_logged_in()

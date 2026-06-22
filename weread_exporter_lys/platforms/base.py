@@ -21,6 +21,7 @@ class ExportRequest:
     crawl_method: str = "xhtml"
     # Limit the number of chapters to crawl (0 = crawl all).
     max_chapters: int = 0
+    debug: bool = False
 
 
 @dataclass(frozen=True)
