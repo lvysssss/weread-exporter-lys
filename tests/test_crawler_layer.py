@@ -188,9 +188,9 @@ class WeReadCrawlerTests(unittest.TestCase):
         self.assertEqual(paths.cover_path, Path("cache") / "book1" / "封面.jpg")
         # Content lives under the per-method subdir (xhtml is the default),
         # isolated from the canvas method's content.
-        self.assertEqual(paths.content_dir, Path("cache") / "book1" / "xhtml" / "content")
-        self.assertEqual(paths.images_dir, Path("cache") / "book1" / "xhtml" / "images")
-        self.assertEqual(paths.state_path, Path("cache") / "book1" / "xhtml" / "state.json")
+        self.assertEqual(paths.content_dir, Path("cache") / "book1" / "canvas" / "content")
+        self.assertEqual(paths.images_dir, Path("cache") / "book1" / "canvas" / "images")
+        self.assertEqual(paths.state_path, Path("cache") / "book1" / "canvas" / "state.json")
         self.assertEqual(paths.auth_state_path, Path("auth.json"))
 
     def test_paths_defaults_auth_state_from_cache_dir(self):

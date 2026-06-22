@@ -19,7 +19,7 @@ class AppConfig:
     delay: float = 1.0
     headless: bool = False
     auth_state_path: Path | None = None
-    crawl_method: str = "xhtml"
+    crawl_method: str = "canvas"
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "AppConfig":

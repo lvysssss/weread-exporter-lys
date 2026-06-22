@@ -355,6 +355,7 @@ class WeReadPageFetcher:
         self._debug(f"_extract_via_xhtml: markdown len={len(markdown)}, rare_srcs={len(rare_srcs)}")
         if not markdown or len(markdown) < 30:
             return None
+
         if images_dir is not None:
             images_dir.mkdir(parents=True, exist_ok=True)
             src_to_stem = collect_rare_char_srcs(xhtml)
@@ -416,11 +417,36 @@ class WeReadPageFetcher:
 
             rare_srcs: set[str] = set()
             rare_chars: list[dict] = []
-            if images_dir is not None:
-                raw_rare = await self._rare_char_images()
-                if raw_rare:
-                    rare_chars = await self._download_rare_chars(raw_rare, images_dir)
-                    rare_srcs = {rc.get("src", "") for rc in raw_rare if rc.get("src")}
+            raw_rare = await self._rare_char_images() if images_dir is not None else []
+            self._debug(f"extract: rare_char_images count={len(raw_rare)}")
+
+            # If rare chars are present, wait for e_N responses (may still be
+            # in flight from the chapter navigation) before deciding to switch.
+            if raw_rare and not self._chapter_responses:
+                await self._wait_for_chapter_responses(timeout=2.0)
+                self._debug(f"extract: after rare-char wait, ch_responses={len(self._chapter_responses)}")
+
+            # Rare chars detected → switch to XHTML for zero-offset placement.
+            # canvas coordinate-merge has 0-5 char error; XHTML inlines <img>
+            # at the exact source position.  Only switch when we actually
+            # captured e_N responses (some chapters don't fire them).
+            if raw_rare and self._chapter_responses:
+                self._debug("extract: rare chars detected, switching to XHTML")
+                try:
+                    content = await self._extract_via_xhtml(
+                        images_dir=images_dir, anti_crawl_status=anti_crawl_status,
+                    )
+                    if content is not None:
+                        return content
+                except Exception as error:
+                    emit(self.on_progress, ProgressEvent(
+                        kind="warning",
+                        message=f"XHTML 切换失败，继续 canvas 路径：{error}",
+                    ))
+
+            if raw_rare:
+                rare_chars = await self._download_rare_chars(raw_rare, images_dir)
+                rare_srcs = {rc.get("src", "") for rc in raw_rare if rc.get("src")}
 
             if rare_chars:
                 line_records = await self.page.evaluate(

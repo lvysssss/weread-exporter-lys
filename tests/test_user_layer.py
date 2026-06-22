@@ -102,12 +102,12 @@ class CliTests(unittest.TestCase):
         self.assertTrue(request.headless)
         self.assertEqual(request.auth_state_path, Path("auth.json"))
 
-    def test_crawl_method_defaults_to_xhtml(self):
+    def test_crawl_method_defaults_to_canvas(self):
         parser = build_parser()
         args = parser.parse_args([])
         request = build_request(args, AppConfig())
         if request is not None:
-            self.assertEqual(request.crawl_method, "xhtml")
+            self.assertEqual(request.crawl_method, "canvas")
 
     def test_crawl_method_canvas_flag_propagates(self):
         parser = build_parser()

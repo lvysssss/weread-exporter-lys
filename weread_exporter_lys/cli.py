@@ -31,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--crawl-method",
         choices=SUPPORTED_CRAWL_METHODS,
-        default="xhtml",
+        default="canvas",
         help="爬取方法：xhtml（默认，结构化源直取，生僻字零误差）或 canvas（旧法，坐标合并）",
     )
     parser.add_argument(
